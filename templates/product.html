@@ -1,0 +1,187 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>{{.ProductName}} - 价格走势</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=Noto+Sans+SC:wght@400;500;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="{{.BasePath}}/static/style.css" />
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body>
+  <div class="glow glow-a"></div>
+  <div class="glow glow-b"></div>
+
+  <main class="container">
+    <header class="hero card product-hero">
+      <div>
+        <p class="tag">TREND LINE</p>
+        <h1>{{.ProductName}}</h1>
+        <p class="sub">近 7 天价格走势与明细台账</p>
+      </div>
+      <a class="btn-link" href="{{.BasePath}}/">返回总览</a>
+    </header>
+
+    <section class="card chart-card">
+      <canvas id="priceChart"></canvas>
+    </section>
+
+    <section class="card">
+      <div class="section-head">
+        <h2>价格台账</h2>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>日期</th><th>抓取时间</th><th>价格</th></tr>
+          </thead>
+          <tbody id="ledger"></tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    const BASE_PATH = '{{.BasePath}}';
+    function withBase(path) {
+      return `${BASE_PATH}${path}`;
+    }
+
+    const productID = {{.ProductID}};
+    const currency = 'HKD';
+
+    function fmtMoney(v) {
+      if (typeof v !== 'number' || Number.isNaN(v)) return '-';
+      return v.toFixed(2);
+    }
+
+    function formatDateTimeCN(input) {
+      if (!input) return '-';
+      const s = String(input).replace('T', ' ').replace('Z', '');
+      const m = s.match(/\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}/);
+      if (m) return m[0];
+      const d = new Date(input);
+      if (Number.isNaN(d.getTime())) return s;
+      return new Intl.DateTimeFormat('zh-CN', {
+        timeZone: 'Asia/Shanghai',
+        hour12: false,
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit',
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit'
+      }).format(d).replace(/\//g, '-');
+    }
+
+    async function loadHistory() {
+      const [historyRes, fxRes] = await Promise.all([
+        fetch(withBase(`/api/products/${productID}/history?days=365`)),
+        fetch(withBase('/api/fx/hkd-cny/today')).catch(() => null),
+      ]);
+      const data = await historyRes.json();
+      let fallbackRate = null;
+      if (fxRes && fxRes.ok) {
+        const fx = await fxRes.json();
+        if (Number.isFinite(fx.rate) && fx.rate > 0) {
+          fallbackRate = fx.rate;
+        }
+      }
+
+      const chartData = data.slice(-7);
+      const labels = chartData.map(d => d.date);
+      const pricesHKD = chartData.map(d => d.price);
+      const pricesCNY = chartData.map(d => (
+        typeof d.cny_price === 'number' && Number.isFinite(d.cny_price)
+          ? d.cny_price
+          : null
+      ));
+
+      new Chart(document.getElementById('priceChart'), {
+        type: 'line',
+        data: {
+          labels,
+          datasets: [
+            {
+              label: '价格 (CNY)',
+              data: pricesCNY,
+              yAxisID: 'yCNY',
+              borderColor: '#67e7ff',
+              backgroundColor: 'rgba(103,231,255,0.18)',
+              borderWidth: 2.4,
+              pointRadius: 0,
+              fill: true,
+              tension: 0.25,
+              spanGaps: false
+            },
+            {
+              label: '价格 (HKD)',
+              data: pricesHKD,
+              yAxisID: 'yHKD',
+              borderColor: '#31d7a3',
+              backgroundColor: 'rgba(49,215,163,0.08)',
+              borderWidth: 2,
+              pointRadius: 0,
+              fill: false,
+              tension: 0.25,
+              spanGaps: false
+            }
+          ]
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          plugins: {
+            legend: {
+              labels: { color: '#d6deff' }
+            }
+          },
+          scales: {
+            x: {
+              ticks: { color: '#9db2f2' },
+              grid: { color: 'rgba(126,152,228,0.2)' }
+            },
+            yCNY: {
+              position: 'left',
+              beginAtZero: false,
+              ticks: { color: '#9db2f2' },
+              grid: { color: 'rgba(126,152,228,0.2)' }
+            },
+            yHKD: {
+              position: 'right',
+              beginAtZero: false,
+              ticks: { color: '#9db2f2' },
+              grid: { drawOnChartArea: false }
+            }
+          }
+        }
+      });
+
+      document.getElementById('ledger').innerHTML = data.map((d, idx) => `
+        <tr style="animation-delay:${idx * 30}ms">
+          <td data-label="日期">${d.date}</td>
+          <td data-label="抓取时间"><span class="muted-mini">${formatDateTimeCN(d.recorded_at)}</span></td>
+          <td data-label="价格">
+            <div class="price-stack">
+              <div class="price-cny">${
+                fmtMoney(
+                  (typeof d.cny_price === 'number' && Number.isFinite(d.cny_price))
+                    ? d.cny_price
+                    : (fallbackRate && typeof d.price === 'number' && Number.isFinite(d.price)
+                      ? Number((d.price * fallbackRate).toFixed(2))
+                      : NaN)
+                )
+              } CNY</div>
+              <div class="price-hkd">${fmtMoney(d.price)} ${currency}</div>
+            </div>
+          </td>
+        </tr>
+      `).join('');
+    }
+
+    loadHistory();
+  </script>
+</body>
+</html>

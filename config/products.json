@@ -1,0 +1,74 @@
+[
+  {
+    "name": "Fujifilm XF 16-50mm F2.8-4.8 R LM WR (Galaxy 水貨)",
+    "store_name": "Galaxy 銀河攝影器材",
+    "url": "https://www.price.com.hk/product.php?p=625915",
+    "price_regex": "merchant_id=9146[\\s\\S]*?product_id=625915[\\s\\S]*?tr_pw=([0-9.]+)[\\s\\S]*?tr_so=w",
+    "update_regex": "Galaxy\\s*銀河攝影器材[\\s\\S]*?([0-9]{4}-[0-9]{2}-[0-9]{2}\\s*更新(?:[\\s\\S]{0,120}?(?:請先查詢|请先查询|少量存貨|少量存货|有現貨|有现货|現貨|现货|缺貨|缺货|預訂|预订|待定|離線|离线))?)",
+    "currency": "HKD",
+    "active": true
+  },
+  {
+    "name": "Nikon Z5II Kit 24-70 F4 (Galaxy 水貨)",
+    "store_name": "Galaxy 銀河攝影器材",
+    "url": "https://www.price.com.hk/product.php?p=658179",
+    "price_regex": "merchant_id=9146[\\s\\S]*?product_id=658179[\\s\\S]*?tr_pw=([0-9.]+)[\\s\\S]*?tr_so=w",
+    "update_regex": "Galaxy\\s*銀河攝影器材[\\s\\S]*?([0-9]{4}-[0-9]{2}-[0-9]{2}\\s*更新(?:[\\s\\S]{0,120}?(?:請先查詢|请先查询|少量存貨|少量存货|有現貨|有现货|現貨|现货|缺貨|缺货|預訂|预订|待定|離線|离线))?)",
+    "currency": "HKD",
+    "active": true
+  },
+  {
+    "name": "Fujifilm XC50-230mmF4.5-6.7 OIS II (Galaxy 水貨)",
+    "store_name": "Galaxy 銀河攝影器材",
+    "url": "https://www.price.com.hk/product.php?p=204286",
+    "price_regex": "merchant_id=9146[\\s\\S]*?product_id=204286[\\s\\S]*?tr_pw=([0-9.]+)[\\s\\S]*?tr_so=w",
+    "update_regex": "Galaxy\\s*銀河攝影器材[\\s\\S]*?([0-9]{4}-[0-9]{2}-[0-9]{2}\\s*更新(?:[\\s\\S]{0,120}?(?:請先查詢|请先查询|少量存貨|少量存货|有現貨|有现货|現貨|现货|缺貨|缺货|預訂|预订|待定|離線|离线))?)",
+    "currency": "HKD",
+    "active": true
+  },
+  {
+    "name": "Sigma 18-50mm F2.8 DC DN for Fujifilm X (Galaxy 水貨)",
+    "store_name": "Galaxy 銀河攝影器材",
+    "url": "https://www.price.com.hk/product.php?p=569595",
+    "price_regex": "merchant_id=9146[\\s\\S]*?product_id=569595[\\s\\S]*?tr_pw=([0-9.]+)[\\s\\S]*?tr_so=w",
+    "update_regex": "Galaxy\\s*銀河攝影器材[\\s\\S]*?([0-9]{4}-[0-9]{2}-[0-9]{2}\\s*更新(?:[\\s\\S]{0,120}?(?:請先查詢|请先查询|少量存貨|少量存货|有現貨|有现货|現貨|现货|缺貨|缺货|預訂|预订|待定|離線|离线))?)",
+    "currency": "HKD",
+    "active": true
+  },
+  {
+    "name": "Fujifilm XF 16-50mm F2.8-4.8 R LM WR (順星水貨)",
+    "store_name": "順星數碼",
+    "url": "https://www.price.com.hk/product.php?p=625915",
+    "price_regex": "(?:順星數碼|顺星数码)[\\s\\S]*?product_id=625915[\\s\\S]*?tr_pw=([0-9.]+)[\\s\\S]*?tr_so=w",
+    "update_regex": "(?:順星數碼|顺星数码)[\\s\\S]*?([0-9]{4}-[0-9]{2}-[0-9]{2}\\s*更新(?:[\\s\\S]{0,120}?(?:請先查詢|请先查询|少量存貨|少量存货|有現貨|有现货|現貨|现货|缺貨|缺货|預訂|预订|待定|離線|离线))?)",
+    "currency": "HKD",
+    "active": true
+  },
+  {
+    "name": "Nikon Z5II Kit 24-70 F4 (順星水貨)",
+    "store_name": "順星數碼",
+    "url": "https://www.price.com.hk/product.php?p=658179",
+    "price_regex": "(?:順星數碼|顺星数码)[\\s\\S]*?product_id=658179[\\s\\S]*?tr_pw=([0-9.]+)[\\s\\S]*?tr_so=w",
+    "update_regex": "(?:順星數碼|顺星数码)[\\s\\S]*?([0-9]{4}-[0-9]{2}-[0-9]{2}\\s*更新(?:[\\s\\S]{0,120}?(?:請先查詢|请先查询|少量存貨|少量存货|有現貨|有现货|現貨|现货|缺貨|缺货|預訂|预订|待定|離線|离线))?)",
+    "currency": "HKD",
+    "active": true
+  },
+  {
+    "name": "Fujifilm XC50-230mmF4.5-6.7 OIS II (順星水貨)",
+    "store_name": "順星數碼",
+    "url": "https://www.price.com.hk/product.php?p=204286",
+    "price_regex": "(?:順星數碼|顺星数码)[\\s\\S]*?product_id=204286[\\s\\S]*?tr_pw=([0-9.]+)[\\s\\S]*?tr_so=w",
+    "update_regex": "(?:順星數碼|顺星数码)[\\s\\S]*?([0-9]{4}-[0-9]{2}-[0-9]{2}\\s*更新(?:[\\s\\S]{0,120}?(?:請先查詢|请先查询|少量存貨|少量存货|有現貨|有现货|現貨|现货|缺貨|缺货|預訂|预订|待定|離線|离线))?)",
+    "currency": "HKD",
+    "active": true
+  },
+  {
+    "name": "Sigma 18-50mm F2.8 DC DN for Fujifilm X (順星水貨)",
+    "store_name": "順星數碼",
+    "url": "https://www.price.com.hk/product.php?p=569595",
+    "price_regex": "(?:順星數碼|顺星数码)[\\s\\S]*?product_id=569595[\\s\\S]*?tr_pw=([0-9.]+)[\\s\\S]*?tr_so=w",
+    "update_regex": "(?:順星數碼|顺星数码)[\\s\\S]*?([0-9]{4}-[0-9]{2}-[0-9]{2}\\s*更新(?:[\\s\\S]{0,120}?(?:請先查詢|请先查询|少量存貨|少量存货|有現貨|有现货|現貨|现货|缺貨|缺货|預訂|预订|待定|離線|离线))?)",
+    "currency": "HKD",
+    "active": true
+  }
+]

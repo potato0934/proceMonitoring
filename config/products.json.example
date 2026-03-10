@@ -1,0 +1,20 @@
+[
+  {
+    "name": "示例商品A (Galaxy 水貨)",
+    "store_name": "Galaxy 銀河攝影器材",
+    "url": "https://www.price.com.hk/product.php?p=625915",
+    "price_regex": "merchant_id=9146[\\s\\S]*?product_id=625915[\\s\\S]*?tr_pw=([0-9.]+)[\\s\\S]*?tr_so=w",
+    "update_regex": "Galaxy\\s*銀河攝影器材[\\s\\S]*?([0-9]{4}-[0-9]{2}-[0-9]{2}\\s*更新(?:[\\s\\S]{0,120}?(?:請先查詢|请先查询|少量存貨|少量存货|有現貨|有现货|現貨|现货|缺貨|缺货|預訂|预订|待定|離線|离线))?)",
+    "currency": "HKD",
+    "active": true
+  },
+  {
+    "name": "示例商品A (順星水貨)",
+    "store_name": "順星數碼",
+    "url": "https://www.price.com.hk/product.php?p=625915",
+    "price_regex": "(?:順星數碼|顺星数码)[\\s\\S]*?product_id=625915[\\s\\S]*?tr_pw=([0-9.]+)[\\s\\S]*?tr_so=w",
+    "update_regex": "(?:順星數碼|顺星数码)[\\s\\S]*?([0-9]{4}-[0-9]{2}-[0-9]{2}\\s*更新(?:[\\s\\S]{0,120}?(?:請先查詢|请先查询|少量存貨|少量存货|有現貨|有现货|現貨|现货|缺貨|缺货|預訂|预订|待定|離線|离线))?)",
+    "currency": "HKD",
+    "active": true
+  }
+]

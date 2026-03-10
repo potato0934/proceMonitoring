@@ -1,0 +1,25 @@
+services:
+  price-monitor:
+    image: price-monitor:0.2
+    container_name: price-monitor
+    user: "0:0"
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      BASE_PATH: "/price"
+      COLLECT_TIMES: "10:00,11:00,15:00"
+      PUSH_TIMES: "12:00"
+      SCHEDULE_TZ: "Asia/Shanghai"
+      FLARESOLVERR_V2: "true"
+      FLARESOLVERR_HTTP_TIMEOUT_SECONDS: "60"
+      FLARESOLVERR_MAX_TIMEOUT_MS: "60000"
+      FLARESOLVERR_MAX_RETRIES: "1"
+      FLARESOLVERR_BREAKER_FAILS: "2"
+      FLARESOLVERR_BREAKER_MINUTES: "15"
+      FLARESOLVERR_RECYCLE_SESSION: "false"
+      FLARESOLVERR_PROXY_URL: ""
+      WECHAT_BOT_WEBHOOK: "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=b109bcf8-2316-4015-9a8f-7c3770799f0c"
+    volumes:
+      - /root/priceMonitoring/data:/app/data
+      - /root/priceMonitoring/logs:/app/logs

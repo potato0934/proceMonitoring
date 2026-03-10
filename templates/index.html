@@ -1,0 +1,558 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>价格监控台</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=Noto+Sans+SC:wght@400;500;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="{{.BasePath}}/static/style.css" />
+</head>
+<body>
+  <div class="glow glow-a"></div>
+  <div class="glow glow-b"></div>
+
+  <main class="container">
+    <header class="hero card">
+      <div>
+        <p class="tag">PRICE RADAR</p>
+        <h1>价格监控台</h1>
+        <p class="sub">追踪摄影器材水货报价变化，自动入库，快速发现低价窗口。</p>
+      </div>
+      <div class="hero-actions">
+        <button id="addProductBtn" class="btn-link">新增采集项</button>
+        <button id="refreshBtn" class="btn-link">刷新数据</button>
+        <button id="collectBtn" class="btn-primary">立即采集</button>
+      </div>
+    </header>
+
+    <section class="stats-grid">
+      <article class="card stat">
+        <p class="stat-label">24h 平均变化</p>
+        <p class="stat-value" id="statDayChange">-</p>
+        <p class="stat-sub">对比前一条记录</p>
+      </article>
+      <article class="card stat">
+        <p class="stat-label">7天平均波动率</p>
+        <p class="stat-value" id="statVolatility">-</p>
+        <p class="stat-sub">标准差 / 均价</p>
+      </article>
+      <article class="card stat">
+        <p class="stat-label">最后更新时间</p>
+        <p class="stat-value" id="statLastUpdate">-</p>
+        <p class="stat-sub" id="statUpdatedToday">今日更新 0 件</p>
+      </article>
+    </section>
+
+    <section class="card">
+      <div class="section-head">
+        <h2>商品台账</h2>
+        <span id="countBadge" class="badge">0 件商品</span>
+      </div>
+      <div class="filters-row">
+        <select id="filterProductName" class="ui-field">
+          <option value="">全部商品</option>
+        </select>
+        <select id="filterStore" class="ui-field">
+          <option value="">全部店铺</option>
+        </select>
+        <button id="clearFiltersBtn" class="btn-link">清空筛选</button>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>ID</th>
+              <th>商品</th>
+              <th>店铺</th>
+              <th>最新价格</th>
+              <th>手续费(1%)</th>
+              <th>商户更新</th>
+              <th>采集状态</th>
+              <th>操作</th>
+            </tr>
+          </thead>
+          <tbody id="rows"></tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+
+  <div id="uiModal" class="ui-modal" aria-hidden="true">
+    <div class="ui-modal-backdrop"></div>
+    <div class="ui-modal-panel card">
+      <h3 id="uiModalTitle" class="ui-modal-title"></h3>
+      <p id="uiModalMessage" class="ui-modal-message"></p>
+      <div id="uiModalBody" class="ui-modal-body"></div>
+      <div class="ui-modal-actions">
+        <button id="uiModalCancel" class="btn-link">取消</button>
+        <button id="uiModalConfirm" class="btn-primary">确定</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="uiToast" class="ui-toast" aria-hidden="true"></div>
+
+  <script>
+    const BASE_PATH = '{{.BasePath}}';
+    function withBase(path) {
+      return `${BASE_PATH}${path}`;
+    }
+
+    function mean(arr) {
+      if (!arr.length) return 0;
+      return arr.reduce((a, b) => a + b, 0) / arr.length;
+    }
+
+    function stddev(arr) {
+      if (arr.length < 2) return 0;
+      const m = mean(arr);
+      const v = mean(arr.map(x => (x - m) ** 2));
+      return Math.sqrt(v);
+    }
+
+    function pct(n) {
+      const sign = n > 0 ? '+' : '';
+      return `${sign}${n.toFixed(2)}%`;
+    }
+
+    function setDeltaStyle(el, n) {
+      el.classList.remove('up', 'down', 'flat');
+      if (n > 0.01) el.classList.add('up');
+      else if (n < -0.01) el.classList.add('down');
+      else el.classList.add('flat');
+    }
+
+    function formatYMD(input) {
+      if (!input) return '-';
+      const s = String(input);
+      const m = s.match(/\d{4}-\d{2}-\d{2}/);
+      if (m) return m[0];
+      const d = new Date(s);
+      if (Number.isNaN(d.getTime())) return s;
+      return d.toISOString().slice(0, 10);
+    }
+
+    function formatDateTimeCN(input) {
+      if (!input) return '-';
+      const s = String(input).replace('T', ' ').replace('Z', '');
+      const m = s.match(/\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}/);
+      if (m) return m[0];
+      const d = new Date(input);
+      if (Number.isNaN(d.getTime())) return s;
+      return new Intl.DateTimeFormat('zh-CN', {
+        timeZone: 'Asia/Shanghai',
+        hour12: false,
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit',
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit'
+      }).format(d).replace(/\//g, '-');
+    }
+
+    function escapeHTML(input) {
+      return String(input ?? '')
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;')
+        .replaceAll("'", '&#39;');
+    }
+
+    function trendMeta(latest, prev) {
+      if (!Number.isFinite(latest) || !Number.isFinite(prev)) {
+        return { icon: '•', cls: 'flat', title: '无前日数据' };
+      }
+      const diff = latest - prev;
+      if (Math.abs(diff) < 0.005) return { icon: '→', cls: 'flat', title: '较前日持平' };
+      if (diff > 0) return { icon: '↑', cls: 'up', title: '较前日上涨' };
+      return { icon: '↓', cls: 'down', title: '较前日下降' };
+    }
+
+    const modalEl = document.getElementById('uiModal');
+    const modalTitleEl = document.getElementById('uiModalTitle');
+    const modalMessageEl = document.getElementById('uiModalMessage');
+    const modalBodyEl = document.getElementById('uiModalBody');
+    const modalCancelEl = document.getElementById('uiModalCancel');
+    const modalConfirmEl = document.getElementById('uiModalConfirm');
+    const toastEl = document.getElementById('uiToast');
+    const filterProductNameEl = document.getElementById('filterProductName');
+    const filterStoreEl = document.getElementById('filterStore');
+    const clearFiltersBtn = document.getElementById('clearFiltersBtn');
+
+    let modalResolve = null;
+    let allProducts = [];
+    let currentFxRate = null;
+
+    function showToast(message, kind = 'info') {
+      toastEl.textContent = message;
+      toastEl.classList.remove('show', 'ok', 'error');
+      if (kind === 'ok') toastEl.classList.add('ok');
+      if (kind === 'error') toastEl.classList.add('error');
+      toastEl.classList.add('show');
+      clearTimeout(showToast._timer);
+      showToast._timer = setTimeout(() => {
+        toastEl.classList.remove('show');
+      }, 2200);
+    }
+
+    function closeModal(payload) {
+      modalEl.classList.remove('show');
+      modalEl.setAttribute('aria-hidden', 'true');
+      if (modalResolve) {
+        modalResolve(payload);
+        modalResolve = null;
+      }
+    }
+
+    function populateStoreFilter(data) {
+      const curr = filterStoreEl.value;
+      const stores = Array.from(new Set(data.map(x => x.latest_store_name || x.store_name || '').filter(Boolean))).sort();
+      filterStoreEl.innerHTML = ['<option value="">全部店铺</option>', ...stores.map(s => `<option value="${escapeHTML(s)}">${escapeHTML(s)}</option>`)].join('');
+      if (stores.includes(curr)) {
+        filterStoreEl.value = curr;
+      }
+    }
+
+    function populateProductFilter(data) {
+      const curr = filterProductNameEl.value;
+      const products = Array.from(new Set(data.map(x => x.name || '').filter(Boolean))).sort();
+      filterProductNameEl.innerHTML = ['<option value="">全部商品</option>', ...products.map(n => `<option value="${escapeHTML(n)}">${escapeHTML(n)}</option>`)].join('');
+      if (products.includes(curr)) {
+        filterProductNameEl.value = curr;
+      }
+    }
+
+    function renderRows(data, fxRate) {
+      const tbody = document.getElementById('rows');
+      tbody.innerHTML = data.map((p, idx) => `
+        <tr style="animation-delay:${idx * 45}ms">
+          <td data-label="ID"><span class="mono">#${p.id}</span></td>
+          <td data-label="商品"><a href="${withBase(`/product/${p.id}`)}">${p.name}</a></td>
+          <td data-label="店铺">${p.latest_store_name || p.store_name || '-'}</td>
+          <td data-label="最新价格">${
+            p.latest_price == null
+              ? '-'
+              : `
+                <div class="price-stack">
+                  <div class="price-cny">
+                    ${(fxRate ? (p.latest_price * fxRate).toFixed(2) : '-')} CNY
+                    ${(() => {
+                      const t = trendMeta(p.latest_price, p.prev_price);
+                      return `<span class="trend-icon ${t.cls}" title="${t.title}">${t.icon}</span>`;
+                    })()}
+                  </div>
+                  <div class="price-hkd">${p.latest_price.toFixed(2)} ${p.currency}</div>
+                </div>
+              `
+          }</td>
+          <td data-label="手续费(1%)">${
+            p.latest_price == null
+              ? '-'
+              : `
+                <div class="price-stack">
+                  <div class="price-cny">${(fxRate ? (p.latest_price * 0.01 * fxRate).toFixed(2) : '-')} CNY</div>
+                  <div class="price-hkd">${(p.latest_price * 0.01).toFixed(2)} ${p.currency}</div>
+                </div>
+              `
+          }</td>
+          <td data-label="商户更新">${p.merchant_update ? `<span class="merchant-update">${escapeHTML(p.merchant_update)}</span>` : '-'}</td>
+          <td data-label="采集状态">${
+            p.last_fetch_ok == null
+              ? '-'
+              : `
+                <div class="fetch-state">
+                  <span class="fetch-badge ${p.last_fetch_ok === 1 ? 'ok' : 'fail'}">${p.last_fetch_ok === 1 ? '成功' : '失败'}</span>
+                  <span class="muted-mini">${p.last_fetch_at ? formatDateTimeCN(p.last_fetch_at) : '-'}</span>
+                </div>
+              `
+          }</td>
+          <td data-label="操作">
+            <a href="${p.url}" target="_blank" rel="noreferrer">打开商品页</a>
+            <br>
+            <button class="btn-mini btn-danger js-delete" data-id="${p.id}" data-name="${escapeHTML(p.name)}">删除</button>
+          </td>
+        </tr>
+      `).join('');
+
+      document.querySelectorAll('.js-delete').forEach((el) => {
+        el.addEventListener('click', async () => {
+          try {
+            await deleteProduct(el.dataset.id, el.dataset.name || '');
+            await loadProducts();
+          } catch (e) {
+            showToast('删除失败: ' + e.message, 'error');
+          }
+        });
+      });
+    }
+
+    function applyFilters() {
+      const productName = (filterProductNameEl.value || '').trim();
+      const store = (filterStoreEl.value || '').trim();
+      const filtered = allProducts.filter((p) => {
+        const n = String(p.name || '');
+        const s = String(p.latest_store_name || p.store_name || '');
+        if (store && s !== store) return false;
+        if (productName && n !== productName) return false;
+        return true;
+      });
+      if (allProducts.length === filtered.length) {
+        document.getElementById('countBadge').textContent = `${allProducts.length} 件商品`;
+      } else {
+        document.getElementById('countBadge').textContent = `${filtered.length}/${allProducts.length} 件商品`;
+      }
+      renderRows(filtered, currentFxRate);
+    }
+
+    function openModal({ title, message = '', bodyHTML = '', confirmText = '确定', cancelText = '取消', danger = false, hideCancel = false }) {
+      modalTitleEl.textContent = title || '';
+      modalMessageEl.textContent = message || '';
+      modalBodyEl.innerHTML = bodyHTML || '';
+      modalConfirmEl.textContent = confirmText;
+      modalCancelEl.textContent = cancelText;
+      modalCancelEl.style.display = hideCancel ? 'none' : '';
+      modalConfirmEl.classList.toggle('btn-danger', !!danger);
+      modalEl.classList.add('show');
+      modalEl.setAttribute('aria-hidden', 'false');
+      return new Promise((resolve) => {
+        modalResolve = resolve;
+      });
+    }
+
+    modalCancelEl.addEventListener('click', () => closeModal({ ok: false }));
+    modalConfirmEl.addEventListener('click', () => closeModal({ ok: true }));
+    modalEl.querySelector('.ui-modal-backdrop').addEventListener('click', () => closeModal({ ok: false }));
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape' && modalEl.classList.contains('show')) {
+        closeModal({ ok: false });
+      }
+    });
+
+    async function addProduct() {
+      const m = await openModal({
+        title: '新增采集项',
+        message: '请输入商品链接，系统会自动抓取商品名称并立即首次采集',
+        bodyHTML: `
+          <label class="ui-field-label">商品链接</label>
+          <input id="modalUrl" class="ui-field" placeholder="https://www.price.com.hk/product.php?p=xxxx" />
+          <label class="ui-field-label">店铺</label>
+          <select id="modalStore" class="ui-field">
+            <option value="Galaxy 銀河攝影器材">Galaxy 銀河攝影器材</option>
+            <option value="順星數碼">順星數碼</option>
+          </select>
+        `,
+        confirmText: '新增',
+      });
+      if (!m.ok) return;
+      const url = (document.getElementById('modalUrl')?.value || '').trim();
+      const store = (document.getElementById('modalStore')?.value || 'Galaxy 銀河攝影器材').trim();
+
+      if (!url) {
+        showToast('链接不能为空', 'error');
+        return;
+      }
+      const normalizedURL = /^https?:\/\//i.test(url) ? url : `https://${url}`;
+
+      const res = await fetch(withBase('/api/products'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url: normalizedURL, store_name: store }),
+      });
+      if (!res.ok) {
+        throw new Error(await res.text());
+      }
+      const out = await res.json();
+      const actionText = out.dedup ? '已去重更新' : '新增成功';
+      if (out.initial_collect === 'success') {
+        showToast(`${actionText}：${out.name}（首次采集成功）`, 'ok');
+      } else if (out.initial_collect === 'failed') {
+        showToast(`${actionText}：${out.name}（首次采集失败）`, 'error');
+      } else {
+        showToast(`${actionText}：${out.name || ''}`, 'ok');
+      }
+    }
+
+    async function deleteProduct(id, name) {
+      const r1 = await openModal({
+        title: '确认删除',
+        message: `确认删除采集项「${name}」？此操作会删除该商品台账历史记录。`,
+        confirmText: '继续',
+        cancelText: '取消',
+        danger: true,
+      });
+      if (!r1.ok) return;
+
+      const r2 = await openModal({
+        title: '二次确认',
+        message: '请输入 DELETE 确认删除',
+        bodyHTML: `<input id="modalDeleteConfirm" class="ui-field" placeholder="DELETE" />`,
+        confirmText: '删除',
+        cancelText: '取消',
+        danger: true,
+      });
+      if (!r2.ok) return;
+      const confirmText = (document.getElementById('modalDeleteConfirm')?.value || '').trim();
+
+      const res = await fetch(withBase(`/api/products/${id}`), {
+        method: 'DELETE',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ confirm: confirmText }),
+      });
+      if (!res.ok) {
+        throw new Error(await res.text());
+      }
+      showToast('删除成功', 'ok');
+    }
+
+    function todayYMDCN() {
+      const parts = new Intl.DateTimeFormat('zh-CN', {
+        timeZone: 'Asia/Shanghai',
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit'
+      }).formatToParts(new Date());
+      const y = parts.find(p => p.type === 'year')?.value;
+      const m = parts.find(p => p.type === 'month')?.value;
+      const d = parts.find(p => p.type === 'day')?.value;
+      return `${y}-${m}-${d}`;
+    }
+
+    async function loadDashboardStats(products) {
+      const today = todayYMDCN();
+      const validLatest = products.filter(p => p.latest_price != null);
+
+      const lastUpdated = validLatest
+        .map(p => p.latest_updated_at || p.latest_date)
+        .filter(Boolean)
+        .sort();
+      if (lastUpdated.length) {
+        const last = lastUpdated[lastUpdated.length - 1];
+        document.getElementById('statLastUpdate').textContent = formatDateTimeCN(last);
+      }
+
+      const updatedToday = validLatest.filter(p => formatYMD(p.latest_updated_at || p.latest_date) === today).length;
+      document.getElementById('statUpdatedToday').textContent = `今日更新 ${updatedToday} 件`;
+
+      const histories = await Promise.all(products.map(async (p) => {
+        try {
+          const r = await fetch(withBase(`/api/products/${p.id}/history?days=8`));
+          if (!r.ok) return [];
+          return await r.json();
+        } catch (e) {
+          return [];
+        }
+      }));
+
+      const dayChanges = [];
+      const volatilities = [];
+      histories.forEach(h => {
+        if (!h || h.length < 2) return;
+        const prices = h.map(x => x.price);
+        const latest = prices[prices.length - 1];
+        const prev = prices[prices.length - 2];
+        if (prev > 0) dayChanges.push(((latest - prev) / prev) * 100);
+
+        const m = mean(prices);
+        if (m > 0) volatilities.push((stddev(prices) / m) * 100);
+      });
+
+      const dayChangeEl = document.getElementById('statDayChange');
+      if (dayChanges.length) {
+        const d = mean(dayChanges);
+        dayChangeEl.textContent = pct(d);
+        setDeltaStyle(dayChangeEl, d);
+      }
+
+      const volEl = document.getElementById('statVolatility');
+      if (volatilities.length) {
+        const v = mean(volatilities);
+        volEl.textContent = `${v.toFixed(2)}%`;
+      }
+    }
+
+    async function loadProducts() {
+      const res = await fetch(withBase('/api/products'));
+      const data = await res.json();
+      allProducts = data;
+
+      let fxRate = null;
+      try {
+        const fxRes = await fetch(withBase('/api/fx/hkd-cny/today'));
+        if (fxRes.ok) {
+          const fx = await fxRes.json();
+          if (Number.isFinite(fx.rate) && fx.rate > 0) {
+            fxRate = fx.rate;
+          }
+        }
+      } catch (e) {}
+      currentFxRate = fxRate;
+      populateProductFilter(allProducts);
+      populateStoreFilter(allProducts);
+      applyFilters();
+
+      await loadDashboardStats(data);
+    }
+
+    document.getElementById('collectBtn').addEventListener('click', async () => {
+      const btn = document.getElementById('collectBtn');
+      btn.disabled = true;
+      btn.textContent = '采集中...';
+      try {
+        const res = await fetch(withBase('/api/collect'), { method: 'POST' });
+        if (!res.ok) throw new Error(await res.text());
+        await loadProducts();
+        showToast('采集完成', 'ok');
+      } catch (e) {
+        showToast('采集失败: ' + e.message, 'error');
+      } finally {
+        btn.disabled = false;
+        btn.textContent = '立即采集';
+      }
+    });
+
+    document.getElementById('refreshBtn').addEventListener('click', async () => {
+      const btn = document.getElementById('refreshBtn');
+      btn.disabled = true;
+      btn.textContent = '刷新中...';
+      try {
+        await loadProducts();
+        showToast('刷新成功', 'ok');
+      } catch (e) {
+        showToast('刷新失败: ' + e.message, 'error');
+      } finally {
+        btn.disabled = false;
+        btn.textContent = '刷新数据';
+      }
+    });
+
+    document.getElementById('addProductBtn').addEventListener('click', async () => {
+      const btn = document.getElementById('addProductBtn');
+      btn.disabled = true;
+      btn.textContent = '新增中...';
+      try {
+        await addProduct();
+        await loadProducts();
+      } catch (e) {
+        showToast('新增失败: ' + e.message, 'error');
+      } finally {
+        btn.disabled = false;
+        btn.textContent = '新增采集项';
+      }
+    });
+
+    filterProductNameEl.addEventListener('change', () => applyFilters());
+    filterStoreEl.addEventListener('change', () => applyFilters());
+    clearFiltersBtn.addEventListener('click', () => {
+      filterProductNameEl.value = '';
+      filterStoreEl.value = '';
+      applyFilters();
+    });
+
+    loadProducts();
+  </script>
+</body>
+</html>
