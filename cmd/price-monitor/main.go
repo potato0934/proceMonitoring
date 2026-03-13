@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -26,8 +25,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/chromedp/cdproto/emulation"
-	"github.com/chromedp/chromedp"
 	_ "modernc.org/sqlite"
 )
 
@@ -68,10 +65,22 @@ type FetchResult struct {
 }
 
 var chinaLoc = mustLoadChinaLocation()
-var defaultFlareSolverrURL = "http://172.25.1.239:8191/v1"
+var defaultFlareSolverrURL = "http://172.25.0.102:8191/v1"
 var defaultBasePath = ""
 var defaultWeComWebhook = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=b109bcf8-2316-4015-9a8f-7c3770799f0c"
 var flareSolverrCB flaresolverrCircuitBreaker
+var flareSolverrReqMu sync.Mutex
+var flareSolverrSessionCache struct {
+	mu      sync.Mutex
+	name    string
+	url     string
+	ensured time.Time
+}
+var collectRunning atomic.Bool
+var weComAlertState struct {
+	mu   sync.Mutex
+	last map[string]time.Time
+}
 
 type App struct {
 	db        *sql.DB
@@ -127,7 +136,7 @@ func (e *httpStatusError) Error() string {
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Println("用法: go run ./cmd/price-monitor [collect|serve|schedule|notify]")
+		fmt.Println("用法: go run ./cmd/price-monitor [collect|ingest|serve|schedule|notify]")
 		os.Exit(1)
 	}
 
@@ -315,7 +324,7 @@ const (
 )
 
 func runSchedule(db *sql.DB) error {
-	timesRaw := envOrDefault("COLLECT_TIMES", "09:00,11:00,15:00")
+	timesRaw := envOrDefault("COLLECT_TIMES", "10:00,11:00,15:00")
 	pushTimesRaw := envOrDefault("PUSH_TIMES", "12:00")
 	locName := envOrDefault("SCHEDULE_TZ", "Asia/Shanghai")
 	log.Printf("[schedule] 启动参数原文: COLLECT_TIMES=%s PUSH_TIMES=%s SCHEDULE_TZ=%s", timesRaw, pushTimesRaw, locName)
@@ -337,8 +346,13 @@ func runSchedule(db *sql.DB) error {
 	log.Printf("[schedule] 定时采集时间表: %s", formatDailySlots(collectSlots))
 	log.Printf("[schedule] 定时推送时间表: %s", formatDailySlots(pushSlots))
 
-	if err := preflightFlareSolverr(); err != nil {
-		log.Printf("[schedule] 启动预检 FlareSolverr 失败，不影响推送任务: %v", err)
+	if useFlareSolverrFallback() {
+		if err := preflightFlareSolverr(); err != nil {
+			log.Printf("[schedule] 启动预检 FlareSolverr 失败，不影响推送任务: %v", err)
+			maybeNotifyFlareSolverrConnectivityAlert("schedule 启动预检", err)
+		}
+	} else {
+		log.Printf("[schedule] 已禁用 FlareSolverr 后备通道（ENABLE_FLARESOLVERR_FALLBACK=false）")
 	}
 	log.Printf("[schedule] 调度已启动")
 
@@ -369,16 +383,18 @@ func runSchedule(db *sql.DB) error {
 		timer.Stop()
 
 		if kind == scheduleCollect {
-			log.Printf("[schedule] 到达采集触发时间，开始预检 FlareSolverr")
-			if err := preflightFlareSolverr(); err != nil {
-				log.Printf("[schedule] 预检失败，跳过本轮采集: %v", err)
-			} else {
-				log.Printf("[schedule] 预检通过，开始执行定时采集")
-				if err := collectToday(db); err != nil {
-					log.Printf("[schedule] 定时采集失败: %v", err)
-				} else {
-					log.Printf("[schedule] 定时采集完成")
+			if useFlareSolverrFallback() {
+				log.Printf("[schedule] 到达采集触发时间，开始预检 FlareSolverr")
+				if err := preflightFlareSolverr(); err != nil {
+					log.Printf("[schedule] 预检失败，继续执行采集（将跳过/快速失败 FlareSolverr）: %v", err)
+					maybeNotifyFlareSolverrConnectivityAlert("schedule 采集前预检", err)
 				}
+			}
+			log.Printf("[schedule] 开始执行定时采集")
+			if err := collectToday(db); err != nil {
+				log.Printf("[schedule] 定时采集失败: %v", err)
+			} else {
+				log.Printf("[schedule] 定时采集完成")
 			}
 			if !runBoth {
 				continue
@@ -799,7 +815,18 @@ func syncProductsFromConfig(db *sql.DB, cfgPath string) error {
 	return tx.Commit()
 }
 
+type collectFailureDetail struct {
+	ProductName string
+	StoreName   string
+	Err         string
+}
+
 func collectToday(db *sql.DB) error {
+	if !collectRunning.CompareAndSwap(false, true) {
+		return fmt.Errorf("采集任务正在执行，跳过重复触发")
+	}
+	defer collectRunning.Store(false)
+
 	products, err := getActiveProducts(db)
 	if err != nil {
 		return err
@@ -811,16 +838,36 @@ func collectToday(db *sql.DB) error {
 	today := chinaNow().Format("2006-01-02")
 	log.Printf("[collect] 本轮采集开始，日期=%s，商品数量=%d", today, len(products))
 	blockedByWAF := false
+	flareConnIssue := false
+	successCount := 0
+	failCount := 0
+	failures := make([]collectFailureDetail, 0, 8)
 	for i, p := range products {
+		if i > 0 {
+			delay := collectItemDelay()
+			if delay > 0 {
+				log.Printf("[collect] 商品间隔等待: %s", delay.String())
+				time.Sleep(delay)
+			}
+		}
 		log.Printf("[collect][%d/%d][%s] 开始采集，店铺=%s，URL=%s", i+1, len(products), p.Name, p.StoreName, p.URL)
 		got, err := fetchPrice(p)
 		if err != nil {
 			log.Printf("[collect][%s] 采集失败: %v", p.Name, err)
+			failCount++
+			failures = append(failures, collectFailureDetail{
+				ProductName: p.Name,
+				StoreName:   p.StoreName,
+				Err:         err.Error(),
+			})
 			_ = insertFetchLog(db, p.ID, false, err.Error())
 			_ = updateLastFetchStatus(db, p.ID, false, err.Error())
 			if strings.Contains(strings.ToLower(err.Error()), "just a moment") ||
 				strings.Contains(strings.ToLower(err.Error()), "cloudflare") {
 				blockedByWAF = true
+			}
+			if isFlareSolverrTargetHost(flareSolverrURL(), "172.25.0.102") && isFlareSolverrConnectivityError(err) {
+				flareConnIssue = true
 			}
 			continue
 		}
@@ -829,6 +876,12 @@ func collectToday(db *sql.DB) error {
 		err = upsertDailyPrice(db, p.ID, today, p.StoreName, got.Price, got.RawPrice, got.MerchantUpdate, p.URL)
 		if err != nil {
 			log.Printf("[collect][%s] 写入失败: %v", p.Name, err)
+			failCount++
+			failures = append(failures, collectFailureDetail{
+				ProductName: p.Name,
+				StoreName:   p.StoreName,
+				Err:         err.Error(),
+			})
 			_ = insertFetchLog(db, p.ID, false, err.Error())
 			_ = updateLastFetchStatus(db, p.ID, false, err.Error())
 			continue
@@ -836,13 +889,31 @@ func collectToday(db *sql.DB) error {
 		log.Printf("[collect][%s] 写入成功，记录抓取日志与状态", p.Name)
 		_ = insertFetchLog(db, p.ID, true, "")
 		_ = updateLastFetchStatus(db, p.ID, true, "")
+		successCount++
 		log.Printf("[collect][%s][%s] 采集成功: price=%.2f raw=%s merchant_update=%s", p.Name, p.StoreName, got.Price, got.RawPrice, got.MerchantUpdate)
 	}
-	log.Printf("[collect] 本轮采集结束")
-	if blockedByWAF {
+	log.Printf("[collect] 本轮采集结束: success=%d failed=%d", successCount, failCount)
+	if failCount > 0 {
+		if err := sendCollectFailureAlertToWeCom(today, successCount, failCount, failures, blockedByWAF, flareConnIssue); err != nil {
+			log.Printf("[alert] 采集失败告警发送失败: %v", err)
+		} else {
+			log.Printf("[alert] 采集失败告警已发送")
+		}
+	}
+	if successCount == 0 && blockedByWAF {
 		return fmt.Errorf("当前被 Cloudflare 挑战拦截（Just a moment），请启用 FlareSolverr 或手动验证会话")
 	}
+	if successCount == 0 {
+		return fmt.Errorf("本轮采集无成功记录")
+	}
 	return nil
+}
+
+type manualPriceInput struct {
+	URL            string  `json:"url"`
+	StoreName      string  `json:"store_name"`
+	Price          float64 `json:"price"`
+	MerchantUpdate string  `json:"merchant_update"`
 }
 
 func getActiveProducts(db *sql.DB) ([]Product, error) {
@@ -867,6 +938,7 @@ func getActiveProducts(db *sql.DB) ([]Product, error) {
 
 func fetchPrice(p Product) (FetchResult, error) {
 	log.Printf("[fetch][%s] 开始抓取链路", p.Name)
+	var fsErr error
 	if useFlareSolverrFallback() && shouldUseFlareSolverrNow() {
 		log.Printf("[fetch][%s] 步骤1: 尝试 FlareSolverr", p.Name)
 		got, err := fetchPriceViaFlareSolverr(p)
@@ -874,9 +946,10 @@ func fetchPrice(p Product) (FetchResult, error) {
 			log.Printf("[fetch][%s] FlareSolverr 抓取成功", p.Name)
 			return got, nil
 		}
-		log.Printf("[fetch][%s] FlareSolverr 失败，回退 HTTP/浏览器: %v", p.Name, err)
+		fsErr = err
+		log.Printf("[fetch][%s] FlareSolverr 失败，回退 HTTP: %v", p.Name, err)
 	} else if useFlareSolverrFallback() {
-		log.Printf("[fetch][%s] 步骤1: 跳过 FlareSolverr（熔断窗口中），直接进入后备通道", p.Name)
+		log.Printf("[fetch][%s] 步骤1: 跳过 FlareSolverr（熔断窗口中）", p.Name)
 	}
 
 	log.Printf("[fetch][%s] 步骤2: 尝试 HTTP 抓取", p.Name)
@@ -909,27 +982,13 @@ func fetchPrice(p Product) (FetchResult, error) {
 		}
 		break
 	}
-	if useBrowserFallback() {
-		log.Printf("[fetch][%s] 步骤3: 进入浏览器后备通道", p.Name)
-		got, err := fetchPriceViaChromeDP(p)
-		if err == nil {
-			log.Printf("[fetch][%s] 浏览器后备通道成功", p.Name)
-			return got, nil
-		}
-		return FetchResult{}, fmt.Errorf("抓取失败（HTTP+浏览器后备）: httpErr=%v, browserErr=%w", lastErr, err)
-	}
-	return FetchResult{}, fmt.Errorf("抓取失败（多次重试）: %w", lastErr)
+	return FetchResult{}, fmt.Errorf("抓取失败: flaresolverrErr=%v httpErr=%w", fsErr, lastErr)
 }
 
-func useBrowserFallback() bool {
-	v := strings.ToLower(strings.TrimSpace(os.Getenv("ENABLE_BROWSER_FALLBACK")))
-	if v == "" {
-		return true
-	}
+func useFlareSolverrFallback() bool {
+	v := strings.ToLower(strings.TrimSpace(envOrDefault("ENABLE_FLARESOLVERR_FALLBACK", "true")))
 	return v == "1" || v == "true" || v == "yes" || v == "on"
 }
-
-func useFlareSolverrFallback() bool { return true }
 
 func flareSolverrSessionName() string {
 	s := strings.TrimSpace(os.Getenv("FLARESOLVERR_SESSION"))
@@ -969,6 +1028,82 @@ func preflightFlareSolverr() error {
 		log.Printf("[flaresolverr] 预检通过，会话=%s", flareSolverrSessionName())
 	}
 	return err
+}
+
+func maybeNotifyFlareSolverrConnectivityAlert(scene string, err error) {
+	fsURL := flareSolverrURL()
+	if !isFlareSolverrTargetHost(fsURL, "172.25.0.102") {
+		return
+	}
+	if !isFlareSolverrConnectivityError(err) {
+		return
+	}
+	if !shouldSendWeComAlert("flaresolverr-connectivity-172.25.0.102", 10*time.Minute) {
+		log.Printf("[alert] FlareSolverr连接告警抑制（冷却中）: scene=%s", scene)
+		return
+	}
+	if nerr := sendFlareSolverrConnectivityAlertToWeCom(scene, fsURL, err); nerr != nil {
+		log.Printf("[alert] FlareSolverr连接告警发送失败: %v", nerr)
+		return
+	}
+	log.Printf("[alert] FlareSolverr连接告警已发送: scene=%s", scene)
+}
+
+func isFlareSolverrTargetHost(fsURL, targetHost string) bool {
+	if strings.TrimSpace(fsURL) == "" || strings.TrimSpace(targetHost) == "" {
+		return false
+	}
+	u, err := url.Parse(fsURL)
+	if err == nil && strings.TrimSpace(u.Hostname()) != "" {
+		return strings.EqualFold(u.Hostname(), targetHost)
+	}
+	return strings.Contains(strings.ToLower(fsURL), strings.ToLower(targetHost))
+}
+
+func isFlareSolverrConnectivityError(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := strings.ToLower(err.Error())
+	if strings.Contains(s, "flaresolverr 不可用(") {
+		return true
+	}
+	signatures := []string{
+		"dial tcp",
+		"connection refused",
+		"i/o timeout",
+		"context deadline exceeded",
+		"client.timeout exceeded",
+		"no such host",
+		"no route to host",
+		"network is unreachable",
+		"connection reset by peer",
+		"eof",
+	}
+	for _, sign := range signatures {
+		if strings.Contains(s, sign) {
+			return true
+		}
+	}
+	return false
+}
+
+func shouldSendWeComAlert(key string, cooldown time.Duration) bool {
+	if cooldown <= 0 {
+		return true
+	}
+	now := chinaNow()
+	weComAlertState.mu.Lock()
+	defer weComAlertState.mu.Unlock()
+	if weComAlertState.last == nil {
+		weComAlertState.last = make(map[string]time.Time)
+	}
+	last, ok := weComAlertState.last[key]
+	if ok && now.Sub(last) < cooldown {
+		return false
+	}
+	weComAlertState.last[key] = now
+	return true
 }
 
 func newBrowserLikeClient() *http.Client {
@@ -1072,107 +1207,14 @@ func warmUpHome(client *http.Client, pageURL, ua string) error {
 	return nil
 }
 
-func fetchPriceViaChromeDP(p Product) (FetchResult, error) {
-	log.Printf("[chromedp][%s] 启动浏览器后备抓取", p.Name)
-	ua := "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
-	headless := strings.ToLower(strings.TrimSpace(envOrDefault("CHROME_HEADLESS", "true"))) != "false"
-	userDataDir := strings.TrimSpace(os.Getenv("CHROME_USER_DATA_DIR"))
-	manualWaitSec := 0
-	if s := strings.TrimSpace(envOrDefault("CHROME_MANUAL_WAIT_SECONDS", "0")); s != "" {
-		if n, err := strconv.Atoi(s); err == nil && n >= 0 && n <= 900 {
-			manualWaitSec = n
+func collectItemDelay() time.Duration {
+	ms := 2500
+	if v := strings.TrimSpace(envOrDefault("COLLECT_ITEM_DELAY_MS", "2500")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 && n <= 10000 {
+			ms = n
 		}
 	}
-
-	opts := append(chromedp.DefaultExecAllocatorOptions[:],
-		chromedp.Flag("headless", headless),
-		chromedp.Flag("disable-gpu", true),
-		chromedp.Flag("disable-blink-features", "AutomationControlled"),
-		chromedp.Flag("no-default-browser-check", true),
-		chromedp.Flag("no-first-run", true),
-		chromedp.Flag("window-size", "1366,900"),
-	)
-	if userDataDir != "" {
-		opts = append(opts, chromedp.UserDataDir(userDataDir))
-	}
-	allocCtx, cancelAlloc := chromedp.NewExecAllocator(context.Background(), opts...)
-	defer cancelAlloc()
-
-	ctx, cancelCtx := chromedp.NewContext(allocCtx)
-	defer cancelCtx()
-
-	totalTimeout := 45 * time.Second
-	if !headless && manualWaitSec > 0 {
-		totalTimeout = time.Duration(manualWaitSec)*time.Second + 30*time.Second
-	}
-	timeoutCtx, cancelTimeout := context.WithTimeout(ctx, totalTimeout)
-	defer cancelTimeout()
-
-	tasks := chromedp.Tasks{
-		emulation.SetUserAgentOverride(ua),
-		chromedp.Navigate(p.URL),
-		chromedp.Sleep(3 * time.Second),
-	}
-	if err := chromedp.Run(timeoutCtx, tasks); err != nil {
-		return FetchResult{}, err
-	}
-	log.Printf("[chromedp][%s] 页面已加载，开始匹配价格", p.Name)
-
-	re, err := regexp.Compile(p.PriceRegex)
-	if err != nil {
-		return FetchResult{}, fmt.Errorf("正则无效: %w", err)
-	}
-
-	matchTimeout := 10 * time.Second
-	if !headless && manualWaitSec > 0 {
-		matchTimeout = time.Duration(manualWaitSec) * time.Second
-		log.Printf("浏览器人工辅助模式已启用，请在 %d 秒内手动完成验证: %s", manualWaitSec, p.Name)
-	}
-
-	raw, err := waitForPriceMatch(timeoutCtx, re, matchTimeout)
-	if err != nil {
-		return FetchResult{}, err
-	}
-	log.Printf("[chromedp][%s] 匹配到价格原始值: %s", p.Name, raw)
-	price, err := parsePrice(raw)
-	if err != nil {
-		return FetchResult{}, fmt.Errorf("浏览器后备通道解析价格失败: %w", err)
-	}
-	var html string
-	if err := chromedp.Run(timeoutCtx, chromedp.OuterHTML("html", &html, chromedp.ByQuery)); err != nil {
-		return FetchResult{}, err
-	}
-	merchantUpdate := extractMerchantUpdate(html, p)
-	if merchantUpdate == "" {
-		merchantUpdate = chinaNow().Format("2006-01-02")
-	}
-	log.Printf("[chromedp][%s] 商户更新字段=%s", p.Name, merchantUpdate)
-	return FetchResult{Price: price, RawPrice: raw, MerchantUpdate: merchantUpdate}, nil
-}
-
-func waitForPriceMatch(ctx context.Context, re *regexp.Regexp, timeout time.Duration) (string, error) {
-	deadline := time.Now().Add(timeout)
-	var lastHTML string
-
-	for {
-		var html string
-		if err := chromedp.Run(ctx, chromedp.OuterHTML("html", &html, chromedp.ByQuery)); err != nil {
-			return "", err
-		}
-		lastHTML = html
-		m := re.FindStringSubmatch(html)
-		if len(m) >= 2 {
-			return strings.TrimSpace(m[1]), nil
-		}
-
-		if time.Now().After(deadline) {
-			if looksLikeCloudflareChallenge(lastHTML) {
-				return "", fmt.Errorf("浏览器后备通道未通过 Cloudflare 挑战（超时）")
-			}
-			return "", fmt.Errorf("浏览器后备通道未匹配到价格（超时）")
-		}
-		time.Sleep(2 * time.Second)
-	}
+	return time.Duration(ms) * time.Millisecond
 }
 
 func looksLikeCloudflareChallenge(html string) bool {
@@ -1187,7 +1229,7 @@ func fetchPriceViaFlareSolverr(p Product) (FetchResult, error) {
 	fsURL := flareSolverrURL()
 	sessionName := flareSolverrSessionName()
 	log.Printf("[flaresolverr][%s] 开始抓取，url=%s session=%s", p.Name, fsURL, sessionName)
-	if _, err := ensureFlareSolverrSession(fsURL, sessionName); err != nil {
+	if _, err := ensureFlareSolverrSessionCached(fsURL, sessionName); err != nil {
 		return FetchResult{}, err
 	}
 
@@ -1198,6 +1240,9 @@ func fetchPriceViaFlareSolverr(p Product) (FetchResult, error) {
 	retries := flareSolverrMaxRetries()
 	for i := 0; i < retries; i++ {
 		log.Printf("[flaresolverr][%s] 请求尝试 #%d", p.Name, i+1)
+		if i > 0 || shouldWarmupFlareSolverr() {
+			_ = warmupFlareSolverrHome(fsURL, sessionName, maxTimeoutMS, httpTimeout)
+		}
 		payload := newFlareSolverrRequestGetPayload(p.URL, sessionName, maxTimeoutMS)
 		resp, err := callFlareSolverr(fsURL, payload, httpTimeout)
 		if err != nil {
@@ -1206,8 +1251,12 @@ func fetchPriceViaFlareSolverr(p Product) (FetchResult, error) {
 			markFlareSolverrFailure(err)
 			if shouldRecycleFlareSolverrSession() {
 				_ = destroyFlareSolverrSession(fsURL, sessionName)
+				invalidateFlareSolverrSessionCache(fsURL, sessionName)
 			}
-			_, _ = ensureFlareSolverrSession(fsURL, sessionName)
+			_, _ = ensureFlareSolverrSessionCached(fsURL, sessionName)
+			if i+1 < retries {
+				time.Sleep(time.Duration(i+1) * 2 * time.Second)
+			}
 			continue
 		}
 		out = resp
@@ -1217,8 +1266,12 @@ func fetchPriceViaFlareSolverr(p Product) (FetchResult, error) {
 			markFlareSolverrFailure(lastErr)
 			if shouldRecycleFlareSolverrSession() {
 				_ = destroyFlareSolverrSession(fsURL, sessionName)
+				invalidateFlareSolverrSessionCache(fsURL, sessionName)
 			}
-			_, _ = ensureFlareSolverrSession(fsURL, sessionName)
+			_, _ = ensureFlareSolverrSessionCached(fsURL, sessionName)
+			if i+1 < retries {
+				time.Sleep(time.Duration(i+1) * 2 * time.Second)
+			}
 			continue
 		}
 		lastErr = nil
@@ -1247,14 +1300,38 @@ func fetchPriceViaFlareSolverr(p Product) (FetchResult, error) {
 	return FetchResult{Price: price, RawPrice: raw, MerchantUpdate: merchantUpdate}, nil
 }
 
+func shouldWarmupFlareSolverr() bool {
+	// 默认开启，先访问首页让会话拿到更稳定的挑战态与 cookie。
+	v := strings.ToLower(strings.TrimSpace(envOrDefault("FLARESOLVERR_WARMUP_HOME", "true")))
+	return v == "1" || v == "true" || v == "yes" || v == "on"
+}
+
+func warmupFlareSolverrHome(fsURL, sessionName string, maxTimeoutMS int, httpTimeout time.Duration) error {
+	homePayload := newFlareSolverrRequestGetPayload("https://www.price.com.hk/", sessionName, minInt(maxTimeoutMS, 45000))
+	_, err := callFlareSolverr(fsURL, homePayload, httpTimeout)
+	if err != nil {
+		log.Printf("[flaresolverr] 首页预热失败(可忽略): %v", err)
+		return err
+	}
+	log.Printf("[flaresolverr] 首页预热成功")
+	return nil
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
 func shouldRecycleFlareSolverrSession() bool {
-	// 默认关闭，减少多实例并发时会话抖动。
+	// 默认关闭，优先复用稳定会话，避免频繁 destroy/create 抖动。
 	v := strings.ToLower(strings.TrimSpace(envOrDefault("FLARESOLVERR_RECYCLE_SESSION", "false")))
 	return v == "1" || v == "true" || v == "yes" || v == "on"
 }
 
 func flareSolverrRequestHTTPTimeout() time.Duration {
-	sec := 60
+	sec := 150
 	if v := strings.TrimSpace(os.Getenv("FLARESOLVERR_HTTP_TIMEOUT_SECONDS")); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n >= 30 && n <= 600 {
 			sec = n
@@ -1264,7 +1341,7 @@ func flareSolverrRequestHTTPTimeout() time.Duration {
 }
 
 func flareSolverrMaxTimeoutMS() int {
-	ms := 60000
+	ms := 120000
 	if v := strings.TrimSpace(os.Getenv("FLARESOLVERR_MAX_TIMEOUT_MS")); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n >= 30000 && n <= 600000 {
 			ms = n
@@ -1274,7 +1351,7 @@ func flareSolverrMaxTimeoutMS() int {
 }
 
 func flareSolverrMaxRetries() int {
-	retries := 1
+	retries := 2
 	if v := strings.TrimSpace(os.Getenv("FLARESOLVERR_MAX_RETRIES")); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n >= 1 && n <= 5 {
 			retries = n
@@ -1308,34 +1385,31 @@ func markFlareSolverrFailure(err error) {
 	flareSolverrCB.mu.Lock()
 	defer flareSolverrCB.mu.Unlock()
 	flareSolverrCB.fails++
-	threshold := 2
+	threshold := 4
 	if v := strings.TrimSpace(os.Getenv("FLARESOLVERR_BREAKER_FAILS")); v != "" {
 		if n, e := strconv.Atoi(v); e == nil && n >= 1 && n <= 10 {
 			threshold = n
 		}
 	}
-	minutes := 15
+	minutes := 10
 	if v := strings.TrimSpace(os.Getenv("FLARESOLVERR_BREAKER_MINUTES")); v != "" {
 		if n, e := strconv.Atoi(v); e == nil && n >= 1 && n <= 120 {
 			minutes = n
 		}
 	}
 	msg := strings.ToLower(err.Error())
-	severe := strings.Contains(msg, "timeout") || strings.Contains(msg, "context deadline exceeded") ||
-		strings.Contains(msg, "just a moment") || strings.Contains(msg, "challenge")
+	severe := strings.Contains(msg, "connection refused") ||
+		strings.Contains(msg, "no such host") ||
+		strings.Contains(msg, "network is unreachable") ||
+		strings.Contains(msg, "tls handshake timeout")
 	if flareSolverrCB.fails >= threshold || severe {
 		flareSolverrCB.disabledTill = chinaNow().Add(time.Duration(minutes) * time.Minute)
 		log.Printf("[flaresolverr] 熔断触发: fails=%d disabled_until=%s", flareSolverrCB.fails, flareSolverrCB.disabledTill.Format("2006-01-02 15:04:05"))
 	}
 }
 
-func useFlareSolverrV2Mode() bool {
-	// 默认按 v2 兼容（request.get 不传 headers）。
-	v := strings.ToLower(strings.TrimSpace(envOrDefault("FLARESOLVERR_V2", "true")))
-	return v != "false"
-}
-
 func newFlareSolverrRequestGetPayload(urlText, sessionName string, maxTimeoutMS int) map[string]any {
+	urlText = normalizeFetchURL(urlText)
 	payload := map[string]any{
 		"cmd":        "request.get",
 		"url":        urlText,
@@ -1345,19 +1419,35 @@ func newFlareSolverrRequestGetPayload(urlText, sessionName string, maxTimeoutMS 
 	if proxyURL := strings.TrimSpace(os.Getenv("FLARESOLVERR_PROXY_URL")); proxyURL != "" {
 		payload["proxy"] = map[string]string{"url": proxyURL}
 	}
-	if useFlareSolverrV2Mode() {
-		return payload
-	}
-	payload["headers"] = map[string]string{
-		"User-Agent":      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
-		"Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-		"Accept-Language": "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7",
-		"Referer":         "https://www.price.com.hk/",
-	}
 	return payload
 }
 
+func normalizeFetchURL(raw string) string {
+	s := normalizeProductURL(strings.TrimSpace(raw))
+	u, err := url.Parse(s)
+	if err != nil {
+		return s
+	}
+	if u.Scheme == "" {
+		u.Scheme = "https"
+	}
+	u.Fragment = ""
+	if u.Host == "" {
+		return s
+	}
+	return u.String()
+}
+
+func shouldSerializeFlareSolverrRequests() bool {
+	v := strings.ToLower(strings.TrimSpace(envOrDefault("FLARESOLVERR_SERIAL", "true")))
+	return v == "1" || v == "true" || v == "yes" || v == "on"
+}
+
 func callFlareSolverr(fsURL string, payload map[string]any, timeout time.Duration) (flareSolverrResp, error) {
+	if shouldSerializeFlareSolverrRequests() {
+		flareSolverrReqMu.Lock()
+		defer flareSolverrReqMu.Unlock()
+	}
 	cmd := ""
 	if v, ok := payload["cmd"].(string); ok {
 		cmd = v
@@ -1397,6 +1487,37 @@ func callFlareSolverr(fsURL string, payload map[string]any, timeout time.Duratio
 	}
 	log.Printf("[flaresolverr] 调用成功: cmd=%s", cmd)
 	return out, nil
+}
+
+func ensureFlareSolverrSessionCached(fsURL, sessionName string) (string, error) {
+	flareSolverrSessionCache.mu.Lock()
+	if flareSolverrSessionCache.name == sessionName &&
+		flareSolverrSessionCache.url == fsURL &&
+		!flareSolverrSessionCache.ensured.IsZero() &&
+		time.Since(flareSolverrSessionCache.ensured) < 10*time.Minute {
+		flareSolverrSessionCache.mu.Unlock()
+		return sessionName, nil
+	}
+	flareSolverrSessionCache.mu.Unlock()
+
+	name, err := ensureFlareSolverrSession(fsURL, sessionName)
+	if err != nil {
+		return "", err
+	}
+	flareSolverrSessionCache.mu.Lock()
+	flareSolverrSessionCache.name = sessionName
+	flareSolverrSessionCache.url = fsURL
+	flareSolverrSessionCache.ensured = chinaNow()
+	flareSolverrSessionCache.mu.Unlock()
+	return name, nil
+}
+
+func invalidateFlareSolverrSessionCache(fsURL, sessionName string) {
+	flareSolverrSessionCache.mu.Lock()
+	defer flareSolverrSessionCache.mu.Unlock()
+	if flareSolverrSessionCache.name == sessionName && flareSolverrSessionCache.url == fsURL {
+		flareSolverrSessionCache.ensured = time.Time{}
+	}
 }
 
 func ensureFlareSolverrSession(fsURL, sessionName string) (string, error) {
@@ -2130,7 +2251,7 @@ func autoDetectProductName(urlText string) (string, error) {
 		httpTimeout := flareSolverrRequestHTTPTimeout()
 		maxTimeoutMS := flareSolverrMaxTimeoutMS()
 		log.Printf("[add-product][name-detect] 尝试 FlareSolverr: url=%s session=%s", fsURL, sessionName)
-		_, _ = ensureFlareSolverrSession(fsURL, sessionName)
+		_, _ = ensureFlareSolverrSessionCached(fsURL, sessionName)
 		resp, err := callFlareSolverr(fsURL, newFlareSolverrRequestGetPayload(urlText, sessionName, maxTimeoutMS), httpTimeout)
 		if err == nil && !looksLikeCloudflareChallenge(resp.Solution.Response) {
 			content = resp.Solution.Response
@@ -2236,106 +2357,6 @@ func normalizeProductDisplayName(name string) string {
 	re := regexp.MustCompile(`\s*\((?:Galaxy\s*水貨|Galaxy\s*水货|順星水貨|顺星水货|順星數碼\s*水貨|顺星数码\s*水货)\)\s*$`)
 	s = re.ReplaceAllString(s, "")
 	return strings.TrimSpace(s)
-}
-
-func compactPushProductName(name string) string {
-	base := normalizeProductBaseName(normalizeProductDisplayName(name))
-	base = strings.Join(strings.Fields(base), " ")
-	if base == "" {
-		return name
-	}
-
-	brand := extractBrand(base)
-	focal := extractFocal(base)
-	aperture := extractAperture(base)
-
-	var parts []string
-	if brand != "" {
-		parts = append(parts, brand)
-	}
-	if focal != "" {
-		parts = append(parts, focal)
-	}
-	if aperture != "" {
-		parts = append(parts, aperture)
-	}
-	if len(parts) >= 2 {
-		return strings.Join(parts, " ")
-	}
-	if brand != "" {
-		return brand
-	}
-	return base
-}
-
-func extractBrand(s string) string {
-	known := regexp.MustCompile(`(?i)\b(Fujifilm|Sigma|Nikon|Canon|Sony|Tamron|Tokina|Viltrox|Zeiss|Laowa|TTArtisan|7Artisans|Voigtlander|Panasonic|Olympus|Leica)\b`)
-	if m := known.FindStringSubmatch(s); len(m) >= 2 {
-		return m[1]
-	}
-	// 回退：跳过常见噪声词，取首个看起来像品牌的 token。
-	stop := map[string]struct{}{
-		"for": {}, "with": {}, "kit": {}, "mount": {}, "lens": {},
-	}
-	for _, token := range strings.Fields(s) {
-		t := strings.Trim(token, " -_/|()[]{}.,:;")
-		if t == "" {
-			continue
-		}
-		lt := strings.ToLower(t)
-		if _, ok := stop[lt]; ok {
-			continue
-		}
-		if regexp.MustCompile(`^[A-Za-z][A-Za-z0-9.+-]{1,}$`).MatchString(t) {
-			return t
-		}
-	}
-	return ""
-}
-
-func extractFocal(s string) string {
-	// 标准镜头焦段：70-300mm / 35mm
-	reMM := regexp.MustCompile(`(?i)\b(\d{1,3}\s*-\s*\d{1,3}\s*mm|\d{1,3}\s*mm)\b`)
-	if m := reMM.FindStringSubmatch(s); len(m) >= 2 {
-		return strings.ToLower(strings.ReplaceAll(m[1], " ", ""))
-	}
-
-	// 无 mm 的写法：24-70 F4 / 16-50 f2.8（RE2 不支持 lookahead，因此改为后续文本判断）
-	reRange := regexp.MustCompile(`(?i)\b(\d{1,3}\s*-\s*\d{1,3})\b`)
-	matches := reRange.FindAllStringSubmatchIndex(s, -1)
-	for _, idx := range matches {
-		if len(idx) < 4 {
-			continue
-		}
-		rawRange := s[idx[2]:idx[3]]
-		tailStart := idx[1]
-		tailEnd := tailStart + 14
-		if tailEnd > len(s) {
-			tailEnd = len(s)
-		}
-		tail := strings.ToLower(s[tailStart:tailEnd])
-		if strings.Contains(tail, "mm") || strings.Contains(tail, "f") {
-			return strings.ToLower(strings.ReplaceAll(rawRange, " ", "")) + "mm"
-		}
-	}
-	return ""
-}
-
-func extractAperture(s string) string {
-	patterns := []*regexp.Regexp{
-		// F4-5.6 / F2.8
-		regexp.MustCompile(`(?i)\bF\s*([0-9]+(?:\.[0-9]+)?(?:\s*-\s*[0-9]+(?:\.[0-9]+)?)?)\b`),
-		// f/2.8 / F/4
-		regexp.MustCompile(`(?i)\bf\s*/\s*([0-9]+(?:\.[0-9]+)?(?:\s*-\s*[0-9]+(?:\.[0-9]+)?)?)\b`),
-	}
-	for _, re := range patterns {
-		m := re.FindStringSubmatch(s)
-		if len(m) < 2 {
-			continue
-		}
-		return "F" + strings.ReplaceAll(m[1], " ", "")
-	}
-	return ""
 }
 
 func (a *App) handleDeleteProduct(w http.ResponseWriter, r *http.Request, idStr string) {
@@ -2620,8 +2641,74 @@ func getLatestStoredFXRate(db *sql.DB, base, quote string) (float64, string, str
 	return rate, day, source, true
 }
 
+func weComWebhook() string {
+	return strings.TrimSpace(envOrDefault("WECHAT_BOT_WEBHOOK", defaultWeComWebhook))
+}
+
+func trimAlertText(s string, maxRunes int) string {
+	s = strings.TrimSpace(strings.ReplaceAll(strings.ReplaceAll(s, "\r", " "), "\n", " "))
+	if maxRunes <= 0 {
+		return ""
+	}
+	r := []rune(s)
+	if len(r) <= maxRunes {
+		return s
+	}
+	return strings.TrimSpace(string(r[:maxRunes])) + "..."
+}
+
+func sendFlareSolverrConnectivityAlertToWeCom(scene, fsURL string, cause error) error {
+	webhook := weComWebhook()
+	if webhook == "" {
+		return fmt.Errorf("未配置 WECHAT_BOT_WEBHOOK")
+	}
+	now := chinaNow().Format("2006-01-02 15:04:05")
+	content := "### FlareSolverr 连接告警\n" +
+		"> 时间: " + now + "\n" +
+		"> 场景: " + trimAlertText(scene, 80) + "\n" +
+		"> 目标: " + trimAlertText(fsURL, 120) + "\n" +
+		"> 错误: " + trimAlertText(cause.Error(), 280) + "\n"
+	return sendWeComMarkdown(webhook, content)
+}
+
+func sendCollectFailureAlertToWeCom(day string, successCount, failCount int, failures []collectFailureDetail, blockedByWAF, flareConnIssue bool) error {
+	webhook := weComWebhook()
+	if webhook == "" {
+		return fmt.Errorf("未配置 WECHAT_BOT_WEBHOOK")
+	}
+	now := chinaNow().Format("2006-01-02 15:04:05")
+	builder := strings.Builder{}
+	builder.WriteString("### 价格采集异常告警\n")
+	builder.WriteString("> 时间: " + now + "\n")
+	builder.WriteString("> 采集日期: " + trimAlertText(day, 32) + "\n")
+	builder.WriteString(fmt.Sprintf("> 结果: success=%d failed=%d\n", successCount, failCount))
+	if blockedByWAF {
+		builder.WriteString("> 风险: 检测到 Cloudflare 挑战页\n")
+	}
+	if flareConnIssue {
+		builder.WriteString("> 风险: 检测到 FlareSolverr 连接异常（172.25.0.102）\n")
+		builder.WriteString("> 节点: " + trimAlertText(flareSolverrURL(), 120) + "\n")
+	}
+	if len(failures) > 0 {
+		builder.WriteString("\n失败明细（最多 5 条）:\n")
+		limit := len(failures)
+		if limit > 5 {
+			limit = 5
+		}
+		for i := 0; i < limit; i++ {
+			f := failures[i]
+			builder.WriteString(fmt.Sprintf("- %s（%s）：%s\n",
+				trimAlertText(f.ProductName, 80),
+				trimAlertText(f.StoreName, 60),
+				trimAlertText(f.Err, 180),
+			))
+		}
+	}
+	return sendWeComMarkdown(webhook, builder.String())
+}
+
 func sendPricePushToWeCom(db *sql.DB) error {
-	webhook := strings.TrimSpace(envOrDefault("WECHAT_BOT_WEBHOOK", defaultWeComWebhook))
+	webhook := weComWebhook()
 	if webhook == "" {
 		return fmt.Errorf("未配置 WECHAT_BOT_WEBHOOK")
 	}

@@ -3,6 +3,9 @@ services:
     image: price-monitor:0.2
     container_name: price-monitor
     user: "0:0"
+    shm_size: "1gb"
+    security_opt:
+      - "seccomp=unconfined"
     restart: unless-stopped
     ports:
       - "8080:8080"
@@ -12,13 +15,28 @@ services:
       PUSH_TIMES: "12:00"
       SCHEDULE_TZ: "Asia/Shanghai"
       FLARESOLVERR_V2: "true"
-      FLARESOLVERR_HTTP_TIMEOUT_SECONDS: "60"
-      FLARESOLVERR_MAX_TIMEOUT_MS: "60000"
-      FLARESOLVERR_MAX_RETRIES: "1"
-      FLARESOLVERR_BREAKER_FAILS: "2"
-      FLARESOLVERR_BREAKER_MINUTES: "15"
+      FLARESOLVERR_URL: "http://172.25.0.102:8191/v1"
+      ENABLE_FLARESOLVERR_FALLBACK: "true"
+      ENABLE_BROWSER_FALLBACK: "false"
+      FLARESOLVERR_HTTP_TIMEOUT_SECONDS: "240"
+      FLARESOLVERR_MAX_TIMEOUT_MS: "180000"
+      FLARESOLVERR_MAX_RETRIES: "3"
+      FLARESOLVERR_BREAKER_FAILS: "4"
+      FLARESOLVERR_BREAKER_MINUTES: "10"
       FLARESOLVERR_RECYCLE_SESSION: "false"
+      FLARESOLVERR_WARMUP_HOME: "false"
+      FLARESOLVERR_SERIAL: "true"
       FLARESOLVERR_PROXY_URL: ""
+      PLAYWRIGHT_HEADLESS: "true"
+      PLAYWRIGHT_TIMEOUT_MS: "60000"
+      PLAYWRIGHT_WAIT_AFTER_LOAD_MS: "3000"
+      PLAYWRIGHT_CHALLENGE_WAIT_MS: "20000"
+      PLAYWRIGHT_MAX_RELOADS: "2"
+      PLAYWRIGHT_EXEC_TIMEOUT_SECONDS: "90"
+      PLAYWRIGHT_BROWSER_PATH: "/usr/bin/chromium"
+      PLAYWRIGHT_DISABLE_SANDBOX: "true"
+      PLAYWRIGHT_EXTRA_ARGS: "--disable-dev-shm-usage"
+      COLLECT_ITEM_DELAY_MS: "2500"
       WECHAT_BOT_WEBHOOK: "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=b109bcf8-2316-4015-9a8f-7c3770799f0c"
     volumes:
       - /root/priceMonitoring/data:/app/data

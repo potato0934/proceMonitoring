@@ -47,6 +47,7 @@
 
 ```bash
 go mod tidy
+npm install
 go run ./cmd/price-monitor collect
 ```
 
@@ -65,25 +66,25 @@ go run ./cmd/price-monitor serve
 
 ## 4. 内置定时采集（推荐）
 
-每天 `09:00`、`15:00`、`22:00` 自动采集：
+每天 `09:00`、`11:00`、`15:00` 自动采集：
 
 ```bash
 go run ./cmd/price-monitor schedule
 ```
 
-`schedule` 模式会在启动时以及每次采集前自动检查 FlareSolverr 可用性；
+`schedule` 模式在启用 FlareSolverr 后备通道时，会在启动时以及每次采集前自动检查 FlareSolverr 可用性；
 若不可用会报错或跳过本轮，避免无效采集。
 
 可配置项：
 
-- `COLLECT_TIMES`：逗号分隔的时间点，格式 `HH:MM`，默认 `09:00,15:00,22:00`
+- `COLLECT_TIMES`：逗号分隔的时间点，格式 `HH:MM`，默认 `09:00,11:00,15:00`
 - `PUSH_TIMES`：逗号分隔的推送时间点，格式 `HH:MM`，默认 `12:00`（企业微信机器人价格推送）
 - `SCHEDULE_TZ`：时区，默认 `Asia/Shanghai`
 
 示例：
 
 ```bash
-COLLECT_TIMES=09:00,15:00,22:00 PUSH_TIMES=12:00 SCHEDULE_TZ=Asia/Shanghai go run ./cmd/price-monitor schedule
+COLLECT_TIMES=09:00,11:00,15:00 PUSH_TIMES=12:00 SCHEDULE_TZ=Asia/Shanghai go run ./cmd/price-monitor schedule
 ```
 
 ## 4.1 企业微信通知配置
@@ -104,12 +105,17 @@ go run ./cmd/price-monitor notify
 
 5. 定时推送由 `schedule` 自动执行，时间通过 `PUSH_TIMES` 配置（默认 `12:00`）。
 
+告警通知（已内置）：
+
+- 当 FlareSolverr 目标为 `172.25.0.102` 且连接不可达时，会自动发送企业微信告警（含错误原因）。
+- 当本轮采集出现失败项（`failed > 0`）时，会自动发送企业微信告警（含失败摘要）。
+
 ## 5. 定时每日采集（macOS/Linux cron，可选）
 
-每天 09:00 自动执行：
+每天 09:00、11:00、15:00 自动执行：
 
 ```cron
-0 9,15,22 * * * cd /Users/potato/Downloads/PriceMonitoring && /usr/local/bin/go run ./cmd/price-monitor collect >> cron.log 2>&1
+0 9,11,15 * * * cd /Users/potato/Downloads/PriceMonitoring && /usr/local/bin/go run ./cmd/price-monitor collect >> cron.log 2>&1
 ```
 
 ## 6. 时区与历史数据
@@ -144,7 +150,7 @@ go run ./cmd/price-monitor notify
 - 先访问站点首页预热 Cookie，再访问商品页
 - 多 User-Agent 重试
 - 对 403/429 自动退避重试
-- HTTP 失败后自动启用浏览器后备通道（`chromedp`）
+- HTTP 失败后自动启用浏览器后备通道（Go + Playwright）
 
 如果仍然 403，程序会使用代码内置的 `cf_clearance` Cookie 尝试请求。
 
@@ -152,18 +158,38 @@ go run ./cmd/price-monitor notify
 
 - `ENABLE_BROWSER_FALLBACK=true`（默认启用）
 - `ENABLE_BROWSER_FALLBACK=false`（禁用）
-- `CHROME_HEADLESS=true`（默认）或 `false`（可见浏览器，便于手动过挑战）
-- `CHROME_USER_DATA_DIR=/path/to/chrome-profile`（可选，持久化 cookie）
-- `CHROME_MANUAL_WAIT_SECONDS=120`（可选，仅在 `CHROME_HEADLESS=false` 时有意义，给人工过验证的等待秒数）
+- `PLAYWRIGHT_HEADLESS=true`（默认）或 `false`（可见浏览器，便于手动过挑战）
+- `PLAYWRIGHT_USER_DATA_DIR=/path/to/browser-profile`（可选，持久化 cookie）
+- `PLAYWRIGHT_MANUAL_WAIT_SECONDS=120`（可选，仅在 `PLAYWRIGHT_HEADLESS=false` 时有意义，给人工过验证的等待秒数）
+- `PLAYWRIGHT_BROWSER_PATH=/usr/bin/chromium`（可选，指定浏览器可执行文件）
+- `PLAYWRIGHT_TIMEOUT_MS=60000`（可选，单次浏览器抓取超时）
+- `PLAYWRIGHT_EXEC_TIMEOUT_SECONDS=90`（可选，Playwright 子进程最大执行时长）
+- `PLAYWRIGHT_WAIT_AFTER_LOAD_MS=3000`（可选，页面加载后额外等待）
+- `PLAYWRIGHT_CHALLENGE_WAIT_MS=20000`（可选，挑战页检测等待窗口）
+- `PLAYWRIGHT_MAX_RELOADS=2`（可选，挑战时自动重载次数）
+- `PLAYWRIGHT_SCRIPT_PATH=./scripts/playwright_fetch.js`（可选，脚本路径）
+- `PLAYWRIGHT_NODE_BIN=node`（可选，Node 可执行路径）
+- `ENABLE_FLARESOLVERR_FALLBACK=true`（默认启用 FlareSolverr）
+- `COLLECT_ITEM_DELAY_MS=800`（可选，商品之间采集间隔，降低反爬触发概率）
 
-注意：浏览器后备通道需要系统安装 Chrome/Chromium（`chromedp` 会调用本机浏览器）。
+注意：浏览器后备通道需要系统安装 Node.js + Chromium，并安装 `playwright-core`（容器镜像已内置）。
+本地 macOS 若未设置 `PLAYWRIGHT_BROWSER_PATH`，程序会尝试自动探测 Chrome/Chromium；仍失败时请执行 `npx playwright install chromium`。
+
+CentOS7 Docker 生产环境建议：
+
+- `PLAYWRIGHT_DISABLE_SANDBOX=true`
+- `PLAYWRIGHT_BROWSER_PATH=/usr/bin/chromium`
+- `shm_size: 1gb`
+- `security_opt: ["seccomp=unconfined"]`
+
+以上配置已在仓库 `docker-compose.yml` 中给出默认值，避免旧内核环境下 Chromium 启动失败。
 
 如果你遇到 Cloudflare 强挑战，建议使用“人工辅助模式”（最稳）：
 
 ```bash
-CHROME_HEADLESS=false \
-CHROME_USER_DATA_DIR=./chrome-profile \
-CHROME_MANUAL_WAIT_SECONDS=180 \
+PLAYWRIGHT_HEADLESS=false \
+PLAYWRIGHT_USER_DATA_DIR=./browser-profile \
+PLAYWRIGHT_MANUAL_WAIT_SECONDS=180 \
 go run ./cmd/price-monitor collect
 ```
 
@@ -182,11 +208,19 @@ docker run -d --name flaresolverr -p 8191:8191 ghcr.io/flaresolverr/flaresolverr
 2. 采集时启用：
 
 ```bash
-FLARESOLVERR_URL='http://127.0.0.1:8191/v1' go run ./cmd/price-monitor collect
+FLARESOLVERR_URL='http://172.25.0.102:8191/v1' go run ./cmd/price-monitor collect
 ```
 
-说明：如果未设置 `FLARESOLVERR_URL`，程序会使用构建时默认值（本地开发默认 `http://127.0.0.1:8191/v1`）。
+说明：如果未设置 `FLARESOLVERR_URL`，程序会使用构建时默认值（当前默认 `http://172.25.0.102:8191/v1`）。
 程序会自动创建并复用会话 `pricemonitor`（可通过 `FLARESOLVERR_SESSION` 覆盖），并在挑战页时自动重建会话重试。
+
+推荐在容器中固定以下参数（已写入仓库 `docker-compose.yml`）：
+
+- `FLARESOLVERR_URL=http://172.25.0.102:8191/v1`
+- `FLARESOLVERR_MAX_TIMEOUT_MS=180000`
+- `FLARESOLVERR_HTTP_TIMEOUT_SECONDS=240`
+- `FLARESOLVERR_MAX_RETRIES=3`
+- `FLARESOLVERR_WARMUP_HOME=false`
 
 可选：
 
@@ -203,7 +237,7 @@ FLARESOLVERR_URL='http://127.0.0.1:8191/v1' go run ./cmd/price-monitor collect
 
 ```bash
 docker build -t price-monitor:latest \
-  --build-arg DEFAULT_FLARESOLVERR_URL=http://172.25.1.239:8191/v1 \
+  --build-arg DEFAULT_FLARESOLVERR_URL=http://172.25.0.102:8191/v1 \
   --build-arg DEFAULT_BASE_PATH=/price \
   .
 ```
@@ -223,11 +257,11 @@ docker run -d --name price-monitor \
 - `serve`（Web 服务）
 - `schedule`（定时采集）
 
-默认调度时间为中国时区：采集 `10:00,15:00,00:00`，推送 `12:00`。  
+默认调度时间为中国时区：采集 `09:00,11:00,15:00`，推送 `12:00`。  
 如需覆盖可在 `docker run` 时传入：
 
 ```bash
--e COLLECT_TIMES="10:00,15:00,00:00" -e PUSH_TIMES="12:00" -e SCHEDULE_TZ="Asia/Shanghai" -e WECHAT_BOT_WEBHOOK="https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxx"
+-e COLLECT_TIMES="09:00,11:00,15:00" -e PUSH_TIMES="12:00" -e SCHEDULE_TZ="Asia/Shanghai" -e WECHAT_BOT_WEBHOOK="https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxx"
 ```
 
 此时访问地址：
@@ -240,10 +274,30 @@ docker run -d --name price-monitor \
 
 ```bash
 mkdir -p /root/priceMonitoring/data /root/priceMonitoring/logs
-docker compose up -d
+docker compose up -d --force-recreate
 ```
 
 映射关系：
 
 - `/root/priceMonitoring/data` -> `/app/data`（SQLite 数据库）
 - `/root/priceMonitoring/logs` -> `/app/logs`（日志）
+
+### 一键部署脚本
+
+仓库已提供一键部署脚本（打包源码、上传服务器、重建镜像、重启容器）：
+
+```bash
+cd /Users/potato/Downloads/PriceMonitoring
+./scripts/deploy_remote.sh
+```
+
+可选参数（环境变量）：
+
+```bash
+REMOTE_HOST=172.25.1.239 \
+REMOTE_USER=root \
+RUN_COLLECT_AFTER_DEPLOY=true \
+./scripts/deploy_remote.sh
+```
+
+说明：默认部署到 `172.25.1.239`，默认镜像标签 `price-monitor:0.2`，默认 FlareSolverr 地址 `http://172.25.0.102:8191/v1`。
