@@ -1,2 +1,8 @@
 .DS_Store
 .idea/
+node_modules/
+logs/
+out/
+data.db
+data.db-shm
+data.db-wal
