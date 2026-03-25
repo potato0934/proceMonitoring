@@ -118,8 +118,8 @@
               label: '价格 (CNY)',
               data: pricesCNY,
               yAxisID: 'yCNY',
-              borderColor: '#67e7ff',
-              backgroundColor: 'rgba(103,231,255,0.18)',
+              borderColor: '#cb8d61',
+              backgroundColor: 'rgba(203,141,97,0.18)',
               borderWidth: 2.4,
               pointRadius: 0,
               fill: true,
@@ -130,8 +130,8 @@
               label: '价格 (HKD)',
               data: pricesHKD,
               yAxisID: 'yHKD',
-              borderColor: '#31d7a3',
-              backgroundColor: 'rgba(49,215,163,0.08)',
+              borderColor: '#8e6f56',
+              backgroundColor: 'rgba(142,111,86,0.08)',
               borderWidth: 2,
               pointRadius: 0,
               fill: false,
@@ -145,24 +145,24 @@
           maintainAspectRatio: false,
           plugins: {
             legend: {
-              labels: { color: '#d6deff' }
+              labels: { color: '#6f5b49' }
             }
           },
           scales: {
             x: {
-              ticks: { color: '#9db2f2' },
-              grid: { color: 'rgba(126,152,228,0.2)' }
+              ticks: { color: '#8a7662' },
+              grid: { color: 'rgba(188,163,138,0.22)' }
             },
             yCNY: {
               position: 'left',
               beginAtZero: false,
-              ticks: { color: '#9db2f2', stepSize: 50 },
-              grid: { color: 'rgba(126,152,228,0.2)' }
+              ticks: { color: '#8a7662', stepSize: 10 },
+              grid: { color: 'rgba(188,163,138,0.22)' }
             },
             yHKD: {
               position: 'right',
               beginAtZero: false,
-              ticks: { color: '#9db2f2' },
+              ticks: { color: '#8a7662' },
               grid: { drawOnChartArea: false }
             }
           }

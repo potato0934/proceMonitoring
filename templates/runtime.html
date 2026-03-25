@@ -1,0 +1,376 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>采集监控</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=Noto+Sans+SC:wght@400;500;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="{{.BasePath}}/static/style.css" />
+</head>
+<body>
+  <div class="glow glow-a"></div>
+  <div class="glow glow-b"></div>
+
+  <main class="container">
+    <header class="hero card product-hero">
+      <div>
+        <p class="tag">RUNTIME MONITOR</p>
+        <h1>采集监控</h1>
+        <p class="sub">查看采集进度、失败分组与服务端日志。</p>
+      </div>
+      <div class="hero-nav-links">
+        <a class="btn-link" href="{{.BasePath}}/">返回总览</a>
+        <a class="btn-link" href="{{.BasePath}}/fx">汇率查看</a>
+        <button id="collectBtn" class="btn-primary">立即采集</button>
+      </div>
+    </header>
+
+    <section class="card runtime-card">
+      <div class="section-head">
+        <h2>采集监控</h2>
+        <div class="runtime-actions">
+          <button id="runtimeRefreshBtn" class="btn-link">刷新监控</button>
+          <label class="runtime-auto">
+            <input id="runtimeAutoPoll" type="checkbox" checked />
+            自动刷新(5s)
+          </label>
+        </div>
+      </div>
+      <div class="runtime-grid">
+        <article class="runtime-item">
+          <p class="runtime-label">运行状态</p>
+          <p class="runtime-value" id="rtRunning">-</p>
+          <p class="runtime-sub" id="rtRunLabel">-</p>
+        </article>
+        <article class="runtime-item">
+          <p class="runtime-label">本轮进度</p>
+          <p class="runtime-value" id="rtProgress">-</p>
+          <p class="runtime-sub" id="rtGroupProgress">-</p>
+        </article>
+        <article class="runtime-item">
+          <p class="runtime-label">本轮结果</p>
+          <p class="runtime-value" id="rtCounters">-</p>
+          <p class="runtime-sub" id="rtPendingRetry">-</p>
+        </article>
+        <article class="runtime-item">
+          <p class="runtime-label">线程与协程</p>
+          <p class="runtime-value" id="rtThreads">-</p>
+          <p class="runtime-sub" id="rtVerbose">-</p>
+        </article>
+      </div>
+
+      <div class="runtime-detail-grid">
+        <article class="runtime-detail">
+          <h3>当前任务</h3>
+          <div id="rtCurrentTask" class="runtime-current">-</div>
+          <div id="rtCurrentGroup" class="runtime-muted">-</div>
+        </article>
+        <article class="runtime-detail">
+          <h3>失败分组</h3>
+          <div id="rtFailBuckets" class="runtime-buckets">-</div>
+          <div id="rtLastError" class="runtime-muted">-</div>
+        </article>
+        <article class="runtime-detail">
+          <h3>最近轮次</h3>
+          <ul id="rtRecentRuns" class="runtime-runs"></ul>
+        </article>
+      </div>
+
+      <div class="runtime-logs-wrap">
+        <div class="runtime-logs-head">
+          <h3>服务端日志（最近）</h3>
+          <span id="rtLogMeta" class="runtime-muted">-</span>
+        </div>
+        <div class="runtime-log-toolbar">
+          <select id="rtLogLimit" class="ui-field ui-field-inline">
+            <option value="100">条数 100</option>
+            <option value="200" selected>条数 200</option>
+            <option value="500">条数 500</option>
+          </select>
+          <label class="runtime-auto">
+            <input id="rtLogFollow" type="checkbox" checked />
+            追踪
+          </label>
+          <label class="runtime-auto">
+            <input id="rtLogShowTs" type="checkbox" />
+            时间
+          </label>
+          <button id="rtLogRefreshBtn" class="btn-mini">刷新</button>
+          <button id="rtLogDownloadBtn" class="btn-mini">下载</button>
+          <button id="rtLogClearBtn" class="btn-mini">清空</button>
+        </div>
+        <pre id="rtLogs" class="runtime-logs"></pre>
+      </div>
+    </section>
+  </main>
+
+  <div id="uiToast" class="ui-toast" aria-hidden="true"></div>
+
+  <script>
+    const BASE_PATH = '{{.BasePath}}';
+    function withBase(path) {
+      return `${BASE_PATH}${path}`;
+    }
+
+    function formatDateTimeCN(input) {
+      if (!input) return '-';
+      const s = String(input).replace('T', ' ').replace('Z', '');
+      const m = s.match(/\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}/);
+      if (m) return m[0];
+      const d = new Date(input);
+      if (Number.isNaN(d.getTime())) return s;
+      return new Intl.DateTimeFormat('zh-CN', {
+        timeZone: 'Asia/Shanghai',
+        hour12: false,
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit',
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit'
+      }).format(d).replace(/\//g, '-');
+    }
+
+    function escapeHTML(input) {
+      return String(input ?? '')
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;')
+        .replaceAll("'", '&#39;');
+    }
+
+    const toastEl = document.getElementById('uiToast');
+    const rtRunningEl = document.getElementById('rtRunning');
+    const rtRunLabelEl = document.getElementById('rtRunLabel');
+    const rtProgressEl = document.getElementById('rtProgress');
+    const rtGroupProgressEl = document.getElementById('rtGroupProgress');
+    const rtCountersEl = document.getElementById('rtCounters');
+    const rtPendingRetryEl = document.getElementById('rtPendingRetry');
+    const rtThreadsEl = document.getElementById('rtThreads');
+    const rtVerboseEl = document.getElementById('rtVerbose');
+    const rtCurrentTaskEl = document.getElementById('rtCurrentTask');
+    const rtCurrentGroupEl = document.getElementById('rtCurrentGroup');
+    const rtFailBucketsEl = document.getElementById('rtFailBuckets');
+    const rtLastErrorEl = document.getElementById('rtLastError');
+    const rtRecentRunsEl = document.getElementById('rtRecentRuns');
+    const rtLogsEl = document.getElementById('rtLogs');
+    const rtLogMetaEl = document.getElementById('rtLogMeta');
+    const runtimeRefreshBtn = document.getElementById('runtimeRefreshBtn');
+    const runtimeAutoPollEl = document.getElementById('runtimeAutoPoll');
+    const rtLogLimitEl = document.getElementById('rtLogLimit');
+    const rtLogFollowEl = document.getElementById('rtLogFollow');
+    const rtLogShowTsEl = document.getElementById('rtLogShowTs');
+    const rtLogRefreshBtn = document.getElementById('rtLogRefreshBtn');
+    const rtLogDownloadBtn = document.getElementById('rtLogDownloadBtn');
+    const rtLogClearBtn = document.getElementById('rtLogClearBtn');
+
+    let runtimeLogSinceID = 0;
+    let runtimeLogStore = [];
+    let runtimeAutoTimer = null;
+
+    function formatDurationMS(ms) {
+      const n = Number(ms || 0);
+      if (!Number.isFinite(n) || n <= 0) return '0s';
+      const sec = Math.floor(n / 1000);
+      const h = Math.floor(sec / 3600);
+      const m = Math.floor((sec % 3600) / 60);
+      const s = sec % 60;
+      if (h > 0) return `${h}h${m}m${s}s`;
+      if (m > 0) return `${m}m${s}s`;
+      return `${s}s`;
+    }
+
+    function safePct(done, total) {
+      if (!total) return '0%';
+      const p = Math.floor((done / total) * 100);
+      return `${Math.max(0, Math.min(100, p))}%`;
+    }
+
+    function showToast(message, kind = 'info') {
+      toastEl.textContent = message;
+      toastEl.classList.remove('show', 'ok', 'error');
+      if (kind === 'ok') toastEl.classList.add('ok');
+      if (kind === 'error') toastEl.classList.add('error');
+      toastEl.classList.add('show');
+      clearTimeout(showToast._timer);
+      showToast._timer = setTimeout(() => {
+        toastEl.classList.remove('show');
+      }, 2200);
+    }
+
+    function renderRuntimeStatus(st) {
+      const running = !!st.collect_running;
+      rtRunningEl.textContent = running ? '采集中' : '空闲';
+      rtRunningEl.classList.toggle('up', running);
+      rtRunningEl.classList.toggle('flat', !running);
+      rtRunLabelEl.textContent = `轮次 #${st.run_id || '-'} · 模式 ${st.run_label || '-'}`;
+
+      const doneItems = Number(st.done_items || 0);
+      const totalItems = Number(st.total_items || 0);
+      const doneGroups = Number(st.done_groups || 0);
+      const totalGroups = Number(st.total_groups || 0);
+      rtProgressEl.textContent = `${doneItems}/${totalItems} (${safePct(doneItems, totalItems)})`;
+      rtGroupProgressEl.textContent = `分组 ${doneGroups}/${totalGroups}${running ? ` · 已运行 ${formatDurationMS(st.run_for_ms)}` : ''}`;
+      rtCountersEl.textContent = `成功 ${st.success_count || 0} / 无货 ${st.out_of_stock_count || 0} / 失败 ${st.fail_count || 0}`;
+      rtPendingRetryEl.textContent = `待补抓 ${st.pending_retry || 0} 个`;
+      rtThreadsEl.textContent = `活跃采集线程 ${st.active_workers || 0} · 协程 ${st.goroutines || 0}`;
+      rtVerboseEl.textContent = `VERBOSE_LOG=${st.verbose_log ? 'true' : 'false'} · 锁状态=${st.collect_lock_running ? 'busy' : 'idle'}`;
+
+      const task = Array.isArray(st.active_tasks) && st.active_tasks.length ? st.active_tasks[0] : null;
+      if (task) {
+        rtCurrentTaskEl.textContent = `${task.product || '-'} (${task.store || '-'}) · ${task.phase || '-'}`;
+      } else {
+        rtCurrentTaskEl.textContent = '-';
+      }
+      rtCurrentGroupEl.textContent = st.current_group_url
+        ? `当前分组 #${st.current_group_index || '-'} · ${st.current_group_url}`
+        : '当前分组 -';
+
+      const fb = st.fail_buckets || {};
+      rtFailBucketsEl.innerHTML = `
+        <span class="bucket">连通性 ${fb.connectivity || 0}</span>
+        <span class="bucket">拦截403 ${fb.waf403 || 0}</span>
+        <span class="bucket">规则/解析 ${fb.regex || 0}</span>
+        <span class="bucket">其他 ${fb.other || 0}</span>
+      `;
+      rtLastErrorEl.textContent = st.last_error ? `最近错误：${st.last_error}` : '最近错误：-';
+
+      const runs = Array.isArray(st.recent_runs) ? st.recent_runs : [];
+      rtRecentRunsEl.innerHTML = runs.slice(0, 8).map((r) => {
+        const cls = r.result === 'success' ? 'ok' : 'fail';
+        const err = r.error ? `<div class="runtime-run-err">${escapeHTML(r.error)}</div>` : '';
+        return `<li class="runtime-run ${cls}">
+          <div>#${r.run_id} ${escapeHTML(r.run_label || '-')} · ${escapeHTML(r.result || '-')} · ${formatDurationMS(r.duration_ms || 0)}</div>
+          <div class="runtime-muted">成功 ${r.success_count || 0} / 无货 ${r.out_of_stock_count || 0} / 失败 ${r.fail_count || 0} · ${escapeHTML(r.ended_at || '-')}</div>
+          ${err}
+        </li>`;
+      }).join('') || '<li class="runtime-muted">暂无历史轮次</li>';
+    }
+
+    function renderRuntimeLogs() {
+      const showTS = !!rtLogShowTsEl.checked;
+      const limit = Number(rtLogLimitEl.value || 200);
+      const view = runtimeLogStore.slice(-limit).map((x) => (
+        showTS ? `${x.ts} ${x.line}` : x.line
+      ));
+      rtLogsEl.textContent = view.length ? view.join('\n') : '暂无日志';
+      rtLogsEl.scrollTop = rtLogsEl.scrollHeight;
+    }
+
+    async function loadRuntimeStatus() {
+      const res = await fetch(withBase('/api/runtime/status'));
+      if (!res.ok) throw new Error(await res.text());
+      const st = await res.json();
+      renderRuntimeStatus(st);
+    }
+
+    async function loadRuntimeLogs(forceFull = false) {
+      if (forceFull) runtimeLogSinceID = 0;
+      const q = new URLSearchParams();
+      q.set('limit', '600');
+      q.set('since_id', String(runtimeLogSinceID || 0));
+      const res = await fetch(withBase(`/api/runtime/logs?${q.toString()}`));
+      if (!res.ok) throw new Error(await res.text());
+      const out = await res.json();
+      const lines = Array.isArray(out.lines) ? out.lines : [];
+      if (lines.length) {
+        if (forceFull) runtimeLogStore = [];
+        runtimeLogStore = runtimeLogStore.concat(lines);
+        if (runtimeLogStore.length > 2200) runtimeLogStore = runtimeLogStore.slice(-2200);
+        renderRuntimeLogs();
+      } else if (!runtimeLogStore.length) {
+        renderRuntimeLogs();
+      }
+      runtimeLogSinceID = Number(out.latest_id || runtimeLogSinceID || 0);
+      rtLogMetaEl.textContent = `latest_id=${runtimeLogSinceID} · ${formatDateTimeCN(new Date().toISOString())}`;
+    }
+
+    async function refreshRuntime(forceFullLogs = false) {
+      try {
+        await Promise.all([loadRuntimeStatus(), loadRuntimeLogs(forceFullLogs)]);
+      } catch (e) {
+        rtLogMetaEl.textContent = `监控刷新失败：${e.message}`;
+      }
+    }
+
+    function startRuntimeAutoPoll() {
+      if (runtimeAutoTimer) clearInterval(runtimeAutoTimer);
+      if (!runtimeAutoPollEl.checked) return;
+      runtimeAutoTimer = setInterval(() => {
+        loadRuntimeStatus().catch(() => {});
+      }, 5000);
+    }
+
+    function startRuntimeLogFollow() {
+      if (startRuntimeLogFollow._timer) clearInterval(startRuntimeLogFollow._timer);
+      if (!rtLogFollowEl.checked) return;
+      startRuntimeLogFollow._timer = setInterval(() => {
+        loadRuntimeLogs(false).catch(() => {});
+      }, 1800);
+    }
+
+    document.getElementById('collectBtn').addEventListener('click', async () => {
+      const btn = document.getElementById('collectBtn');
+      btn.disabled = true;
+      btn.textContent = '采集中...';
+      try {
+        const res = await fetch(withBase('/api/collect'), { method: 'POST' });
+        if (!res.ok) throw new Error(await res.text());
+        showToast('采集完成', 'ok');
+        await refreshRuntime(false);
+      } catch (e) {
+        showToast('采集失败: ' + e.message, 'error');
+      } finally {
+        btn.disabled = false;
+        btn.textContent = '立即采集';
+      }
+    });
+
+    runtimeRefreshBtn.addEventListener('click', async () => {
+      runtimeRefreshBtn.disabled = true;
+      runtimeRefreshBtn.textContent = '刷新中...';
+      await refreshRuntime(false);
+      runtimeRefreshBtn.disabled = false;
+      runtimeRefreshBtn.textContent = '刷新监控';
+    });
+    runtimeAutoPollEl.addEventListener('change', () => startRuntimeAutoPoll());
+    rtLogFollowEl.addEventListener('change', () => {
+      startRuntimeLogFollow();
+      rtLogMetaEl.textContent = rtLogFollowEl.checked ? '日志模式：实时追踪' : '日志模式：非实时（手动刷新）';
+    });
+    rtLogShowTsEl.addEventListener('change', () => renderRuntimeLogs());
+    rtLogLimitEl.addEventListener('change', () => renderRuntimeLogs());
+    rtLogRefreshBtn.addEventListener('click', async () => {
+      rtLogRefreshBtn.disabled = true;
+      rtLogRefreshBtn.textContent = '刷新中...';
+      await loadRuntimeLogs(false);
+      rtLogRefreshBtn.disabled = false;
+      rtLogRefreshBtn.textContent = '刷新';
+    });
+    rtLogDownloadBtn.addEventListener('click', () => {
+      const text = runtimeLogStore.map((x) => `${x.ts} ${x.line}`).join('\n');
+      const blob = new Blob([text || ''], { type: 'text/plain;charset=utf-8' });
+      const a = document.createElement('a');
+      const now = new Date();
+      const stamp = `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, '0')}${String(now.getDate()).padStart(2, '0')}-${String(now.getHours()).padStart(2, '0')}${String(now.getMinutes()).padStart(2, '0')}${String(now.getSeconds()).padStart(2, '0')}`;
+      a.href = URL.createObjectURL(blob);
+      a.download = `price-monitor-logs-${stamp}.log`;
+      a.click();
+      URL.revokeObjectURL(a.href);
+    });
+    rtLogClearBtn.addEventListener('click', () => {
+      runtimeLogStore = [];
+      runtimeLogSinceID = 0;
+      renderRuntimeLogs();
+      rtLogMetaEl.textContent = '日志已清空（仅前端视图）';
+    });
+
+    refreshRuntime(true);
+    startRuntimeAutoPoll();
+    startRuntimeLogFollow();
+  </script>
+</body>
+</html>

@@ -15,36 +15,44 @@
 
   <main class="container">
     <header class="hero card">
-      <div>
+      <div class="hero-head">
         <p class="tag">PRICE RADAR</p>
         <h1>价格监控台</h1>
         <p class="sub">追踪摄影器材水货报价变化，自动入库，快速发现低价窗口。</p>
       </div>
-      <div class="hero-actions">
-        <button id="addProductBtn" class="btn-link">新增采集项</button>
-        <button id="refreshBtn" class="btn-link">刷新数据</button>
-        <button id="collectBtn" class="btn-primary">立即采集</button>
+      <div class="hero-controls">
+        <div class="hero-status">
+          <div class="hero-status-grid">
+            <div class="hero-chip">
+              <p class="hero-chip-label">最后更新时间</p>
+              <p class="hero-chip-main" id="statLastUpdate">-</p>
+            </div>
+            <div class="hero-chip">
+              <p class="hero-chip-label">今日汇率 HKD/CNY</p>
+              <p class="hero-chip-main" id="statFxRate">-</p>
+            </div>
+            <div class="hero-chip">
+              <p class="hero-chip-label">今日更新</p>
+              <p class="hero-chip-main" id="statUpdatedToday">0 件</p>
+            </div>
+            <div id="heroCollectChip" class="hero-chip hero-chip-state idle">
+              <p class="hero-chip-label">采集状态</p>
+              <p class="hero-chip-main" id="heroCollectState">空闲</p>
+              <p class="hero-chip-sub" id="heroCollectDetail">线程 0 · 待补抓 0</p>
+            </div>
+          </div>
+        </div>
+        <div class="hero-actions">
+          <button id="addProductBtn" class="btn-link">新增采集项</button>
+          <button id="refreshBtn" class="btn-link">刷新数据</button>
+          <button id="collectBtn" class="btn-primary">立即采集</button>
+        </div>
+        <div class="hero-nav-links">
+          <a class="btn-link" href="{{.BasePath}}/runtime">采集监控</a>
+          <a class="btn-link" href="{{.BasePath}}/fx">汇率查看</a>
+        </div>
       </div>
     </header>
-
-    <section class="stats-grid">
-      <article class="card stat">
-        <p class="stat-label">24h 平均变化</p>
-        <p class="stat-value" id="statDayChange">-</p>
-        <p class="stat-sub">对比前一条记录</p>
-      </article>
-      <article class="card stat">
-        <p class="stat-label">7天平均波动率</p>
-        <p class="stat-value" id="statVolatility">-</p>
-        <p class="stat-sub">标准差 / 均价</p>
-      </article>
-      <article class="card stat">
-        <p class="stat-label">最后更新时间</p>
-        <p class="stat-value" id="statLastUpdate">-</p>
-        <p class="stat-sub" id="statFxRate">今日汇率 -</p>
-        <p class="stat-sub" id="statUpdatedToday">今日更新 0 件</p>
-      </article>
-    </section>
 
     <section class="card">
       <div class="section-head">
@@ -98,30 +106,6 @@
     const BASE_PATH = '{{.BasePath}}';
     function withBase(path) {
       return `${BASE_PATH}${path}`;
-    }
-
-    function mean(arr) {
-      if (!arr.length) return 0;
-      return arr.reduce((a, b) => a + b, 0) / arr.length;
-    }
-
-    function stddev(arr) {
-      if (arr.length < 2) return 0;
-      const m = mean(arr);
-      const v = mean(arr.map(x => (x - m) ** 2));
-      return Math.sqrt(v);
-    }
-
-    function pct(n) {
-      const sign = n > 0 ? '+' : '';
-      return `${sign}${n.toFixed(2)}%`;
-    }
-
-    function setDeltaStyle(el, n) {
-      el.classList.remove('up', 'down', 'flat');
-      if (n > 0.01) el.classList.add('up');
-      else if (n < -0.01) el.classList.add('down');
-      else el.classList.add('flat');
     }
 
     function formatYMD(input) {
@@ -232,6 +216,34 @@
     let modalResolve = null;
     let allProducts = [];
     let currentFxRate = null;
+    let heroCollectTimer = null;
+    const heroCollectStateEl = document.getElementById('heroCollectState');
+    const heroCollectDetailEl = document.getElementById('heroCollectDetail');
+    const heroCollectChipEl = document.getElementById('heroCollectChip');
+
+    function renderHeroCollectStatus(st) {
+      const running = !!st.collect_running;
+      heroCollectStateEl.textContent = running ? '采集中' : '空闲';
+      heroCollectStateEl.classList.toggle('up', running);
+      heroCollectStateEl.classList.toggle('flat', !running);
+      heroCollectDetailEl.textContent = `线程 ${st.active_workers || 0} · 待补抓 ${st.pending_retry || 0}`;
+      heroCollectChipEl.classList.toggle('running', running);
+      heroCollectChipEl.classList.toggle('idle', !running);
+    }
+
+    async function loadHeroCollectStatus() {
+      const res = await fetch(withBase('/api/runtime/status'));
+      if (!res.ok) throw new Error(await res.text());
+      const st = await res.json();
+      renderHeroCollectStatus(st);
+    }
+
+    function startHeroCollectPoll() {
+      if (heroCollectTimer) clearInterval(heroCollectTimer);
+      heroCollectTimer = setInterval(() => {
+        loadHeroCollectStatus().catch(() => {});
+      }, 1800);
+    }
 
     function showToast(message, kind = 'info') {
       toastEl.textContent = message;
@@ -338,16 +350,20 @@
               ? '-'
               : `
                 <div class="fetch-state">
-                  <span class="fetch-badge ${fetchBadgeClass}"${fetchBadgeTitle}>${fetchBadgeText}</span>
-                  ${showReasonBtn ? `<button class="btn-mini btn-reason js-fetch-reason" data-name="${escapeHTML(p.name)}" data-error="${escapeHTML(p.last_fetch_error)}">查看原因</button>` : ''}
+                  ${
+                    showReasonBtn
+                      ? `<button class="fetch-badge ${fetchBadgeClass} js-fetch-reason" data-name="${escapeHTML(p.name)}" data-error="${escapeHTML(p.last_fetch_error)}"${fetchBadgeTitle}>${fetchBadgeText}</button>`
+                      : `<span class="fetch-badge ${fetchBadgeClass}"${fetchBadgeTitle}>${fetchBadgeText}</span>`
+                  }
                   <span class="muted-mini">${p.last_fetch_at ? formatDateTimeCN(p.last_fetch_at) : '-'}</span>
                 </div>
               `
           }</td>
           <td data-label="操作">
-            <a href="${p.url}" target="_blank" rel="noreferrer">打开商品页</a>
-            <br>
-            <button class="btn-mini btn-danger js-delete" data-id="${p.id}" data-name="${escapeHTML(p.name)}">删除</button>
+            <div class="op-actions">
+              <a class="btn-mini btn-open" href="${p.url}" target="_blank" rel="noreferrer">打开</a>
+              <button class="btn-mini btn-danger js-delete" data-id="${p.id}" data-name="${escapeHTML(p.name)}">删除</button>
+            </div>
           </td>
         </tr>
       `;
@@ -418,27 +434,136 @@
       }
     });
 
+    function normalizeStoreName(input) {
+      return String(input || '').trim().replace(/\s+/g, ' ');
+    }
+
+    function buildStoreOptionsHTML(stores) {
+      return stores.map((s) => `<option value="${escapeHTML(s)}">${escapeHTML(s)}</option>`).join('');
+    }
+
+    async function fetchStoreOptions() {
+      const res = await fetch(withBase('/api/store-options'));
+      if (!res.ok) throw new Error(await res.text());
+      const out = await res.json();
+      const stores = Array.isArray(out.stores) ? out.stores : [];
+      return stores.map(normalizeStoreName).filter(Boolean);
+    }
+
     async function addProduct() {
-      const m = await openModal({
+      let stores = [];
+      try {
+        stores = await fetchStoreOptions();
+      } catch (e) {
+        stores = ['Galaxy 銀河攝影器材', '順星數碼'];
+      }
+      if (!stores.length) {
+        stores = ['Galaxy 銀河攝影器材', '順星數碼'];
+      }
+
+      const modalPromise = openModal({
         title: '新增采集项',
-        message: '请输入商品链接，系统会自动抓取商品名称并立即首次采集',
+        message: '可从下拉框选择店铺，也可输入新店铺后加入列表；下拉中的店铺支持删除。',
         bodyHTML: `
           <label class="ui-field-label">商品链接</label>
           <input id="modalUrl" class="ui-field" placeholder="https://www.price.com.hk/product.php?p=xxxx" />
-          <label class="ui-field-label">店铺</label>
-          <select id="modalStore" class="ui-field">
-            <option value="Galaxy 銀河攝影器材">Galaxy 銀河攝影器材</option>
-            <option value="順星數碼">順星數碼</option>
+          <label class="ui-field-label">店铺（下拉选择）</label>
+          <select id="modalStoreSelect" class="ui-field">
+            ${buildStoreOptionsHTML(stores)}
           </select>
+          <div class="modal-store-row">
+            <input id="modalStoreNew" class="ui-field" placeholder="输入新店铺名，如：XX 数码" />
+            <button id="modalStoreAddBtn" type="button" class="btn-mini">新增店铺</button>
+            <button id="modalStoreDeleteBtn" type="button" class="btn-mini">删除选中</button>
+          </div>
         `,
         confirmText: '新增',
       });
+
+      const storeSelectEl = document.getElementById('modalStoreSelect');
+      const storeNewEl = document.getElementById('modalStoreNew');
+      const storeAddBtn = document.getElementById('modalStoreAddBtn');
+      const storeDeleteBtn = document.getElementById('modalStoreDeleteBtn');
+      let deleteConfirmTarget = '';
+      let deleteConfirmTimer = null;
+      const resetDeleteConfirm = () => {
+        deleteConfirmTarget = '';
+        storeDeleteBtn.textContent = '删除选中';
+        if (deleteConfirmTimer) {
+          clearTimeout(deleteConfirmTimer);
+          deleteConfirmTimer = null;
+        }
+      };
+      const refreshStoreSelect = async (prefer = '') => {
+        stores = await fetchStoreOptions();
+        if (!stores.length) stores = ['Galaxy 銀河攝影器材', '順星數碼'];
+        storeSelectEl.innerHTML = buildStoreOptionsHTML(stores);
+        const target = normalizeStoreName(prefer);
+        if (target && stores.includes(target)) {
+          storeSelectEl.value = target;
+        }
+        resetDeleteConfirm();
+      };
+
+      storeAddBtn.addEventListener('click', async () => {
+        const name = normalizeStoreName(storeNewEl.value);
+        if (!name) {
+          showToast('请输入店铺名称', 'error');
+          return;
+        }
+        const res = await fetch(withBase('/api/store-options'), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name }),
+        });
+        if (!res.ok) {
+          showToast('新增店铺失败: ' + await res.text(), 'error');
+          return;
+        }
+        await refreshStoreSelect(name);
+        storeNewEl.value = '';
+        showToast('店铺已加入下拉列表', 'ok');
+      });
+
+      storeDeleteBtn.addEventListener('click', async () => {
+        const target = normalizeStoreName(storeSelectEl.value);
+        if (!target) {
+          showToast('请先选择要删除的店铺', 'error');
+          return;
+        }
+        if (deleteConfirmTarget !== target) {
+          deleteConfirmTarget = target;
+          storeDeleteBtn.textContent = `再次点击删除：${target}`;
+          if (deleteConfirmTimer) clearTimeout(deleteConfirmTimer);
+          deleteConfirmTimer = setTimeout(() => {
+            resetDeleteConfirm();
+          }, 4000);
+          return;
+        }
+        const res = await fetch(withBase(`/api/store-options?name=${encodeURIComponent(target)}`), {
+          method: 'DELETE',
+        });
+        if (!res.ok) {
+          showToast('删除店铺失败: ' + await res.text(), 'error');
+          resetDeleteConfirm();
+          return;
+        }
+        await refreshStoreSelect();
+        showToast('店铺已从下拉列表删除', 'ok');
+      });
+
+      const m = await modalPromise;
       if (!m.ok) return;
+
       const url = (document.getElementById('modalUrl')?.value || '').trim();
-      const store = (document.getElementById('modalStore')?.value || 'Galaxy 銀河攝影器材').trim();
+      const store = normalizeStoreName((storeNewEl?.value || '').trim() || (storeSelectEl?.value || 'Galaxy 銀河攝影器材'));
 
       if (!url) {
         showToast('链接不能为空', 'error');
+        return;
+      }
+      if (!store) {
+        showToast('店铺不能为空', 'error');
         return;
       }
       const normalizedURL = /^https?:\/\//i.test(url) ? url : `https://${url}`;
@@ -466,27 +591,14 @@
       const r1 = await openModal({
         title: '确认删除',
         message: `确认删除采集项「${name}」？此操作会删除该商品台账历史记录。`,
-        confirmText: '继续',
+        confirmText: '确认删除',
         cancelText: '取消',
         danger: true,
       });
       if (!r1.ok) return;
 
-      const r2 = await openModal({
-        title: '二次确认',
-        message: '请输入 DELETE 确认删除',
-        bodyHTML: `<input id="modalDeleteConfirm" class="ui-field" placeholder="DELETE" />`,
-        confirmText: '删除',
-        cancelText: '取消',
-        danger: true,
-      });
-      if (!r2.ok) return;
-      const confirmText = (document.getElementById('modalDeleteConfirm')?.value || '').trim();
-
       const res = await fetch(withBase(`/api/products/${id}`), {
         method: 'DELETE',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ confirm: confirmText }),
       });
       if (!res.ok) {
         throw new Error(await res.text());
@@ -505,59 +617,6 @@
       const m = parts.find(p => p.type === 'month')?.value;
       const d = parts.find(p => p.type === 'day')?.value;
       return `${y}-${m}-${d}`;
-    }
-
-    async function loadDashboardStats(products) {
-      const today = todayYMDCN();
-      const validLatest = products.filter(p => p.latest_price != null);
-
-      const lastUpdated = validLatest
-        .map(p => p.latest_updated_at || p.latest_date)
-        .filter(Boolean)
-        .sort();
-      if (lastUpdated.length) {
-        const last = lastUpdated[lastUpdated.length - 1];
-        document.getElementById('statLastUpdate').textContent = formatDateTimeCN(last);
-      }
-
-      const updatedToday = validLatest.filter(p => formatYMD(p.latest_updated_at || p.latest_date) === today).length;
-      document.getElementById('statUpdatedToday').textContent = `今日更新 ${updatedToday} 件`;
-
-      const histories = await Promise.all(products.map(async (p) => {
-        try {
-          const r = await fetch(withBase(`/api/products/${p.id}/history?days=8`));
-          if (!r.ok) return [];
-          return await r.json();
-        } catch (e) {
-          return [];
-        }
-      }));
-
-      const dayChanges = [];
-      const volatilities = [];
-      histories.forEach(h => {
-        if (!h || h.length < 2) return;
-        const prices = h.map(x => x.price);
-        const latest = prices[prices.length - 1];
-        const prev = prices[prices.length - 2];
-        if (prev > 0) dayChanges.push(((latest - prev) / prev) * 100);
-
-        const m = mean(prices);
-        if (m > 0) volatilities.push((stddev(prices) / m) * 100);
-      });
-
-      const dayChangeEl = document.getElementById('statDayChange');
-      if (dayChanges.length) {
-        const d = mean(dayChanges);
-        dayChangeEl.textContent = pct(d);
-        setDeltaStyle(dayChangeEl, d);
-      }
-
-      const volEl = document.getElementById('statVolatility');
-      if (volatilities.length) {
-        const v = mean(volatilities);
-        volEl.textContent = `${v.toFixed(2)}%`;
-      }
     }
 
     async function loadProducts() {
@@ -579,14 +638,23 @@
       } catch (e) {}
       currentFxRate = fxRate;
       const fxText = fxRate
-        ? `今日汇率 HKD/CNY ${fxRate.toFixed(4)}${fxDate ? `（${fxDate}）` : ''}`
-        : '今日汇率 暂不可用';
+        ? `${fxRate.toFixed(4)}${fxDate ? `（${fxDate}）` : ''}`
+        : '暂不可用';
       document.getElementById('statFxRate').textContent = fxText;
       populateProductFilter(allProducts);
       populateStoreFilter(allProducts);
       applyFilters();
-
-      await loadDashboardStats(data);
+      const today = todayYMDCN();
+      const validLatest = data.filter(p => p.latest_price != null);
+      const lastUpdated = validLatest
+        .map(p => p.latest_updated_at || p.latest_date)
+        .filter(Boolean)
+        .sort();
+      document.getElementById('statLastUpdate').textContent = lastUpdated.length
+        ? formatDateTimeCN(lastUpdated[lastUpdated.length - 1])
+        : '-';
+      const updatedToday = validLatest.filter(p => formatYMD(p.latest_updated_at || p.latest_date) === today).length;
+      document.getElementById('statUpdatedToday').textContent = `${updatedToday} 件`;
     }
 
     document.getElementById('collectBtn').addEventListener('click', async () => {
@@ -603,6 +671,7 @@
       } finally {
         btn.disabled = false;
         btn.textContent = '立即采集';
+        loadHeroCollectStatus().catch(() => {});
       }
     });
 
@@ -618,6 +687,7 @@
       } finally {
         btn.disabled = false;
         btn.textContent = '刷新数据';
+        loadHeroCollectStatus().catch(() => {});
       }
     });
 
@@ -633,6 +703,7 @@
       } finally {
         btn.disabled = false;
         btn.textContent = '新增采集项';
+        loadHeroCollectStatus().catch(() => {});
       }
     });
 
@@ -645,6 +716,8 @@
     });
 
     loadProducts();
+    loadHeroCollectStatus().catch(() => {});
+    startHeroCollectPoll();
   </script>
 </body>
 </html>

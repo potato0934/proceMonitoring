@@ -18,12 +18,14 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	_ "modernc.org/sqlite"
 )
@@ -134,6 +136,376 @@ type dailyLogWriter struct {
 }
 
 var httpRequestSeq uint64
+var runtimeMon = newRuntimeMonitor(1200, 20)
+
+type runtimeLogEntry struct {
+	ID   int64  `json:"id"`
+	TS   string `json:"ts"`
+	Line string `json:"line"`
+}
+
+type runtimeTask struct {
+	Worker    string `json:"worker"`
+	ProductID int64  `json:"product_id"`
+	Product   string `json:"product"`
+	Store     string `json:"store"`
+	Phase     string `json:"phase"`
+	UpdatedAt string `json:"updated_at"`
+}
+
+type runtimeCollectRunSummary struct {
+	RunID           int64  `json:"run_id"`
+	RunLabel        string `json:"run_label"`
+	StartedAt       string `json:"started_at"`
+	EndedAt         string `json:"ended_at"`
+	DurationMS      int64  `json:"duration_ms"`
+	TotalItems      int    `json:"total_items"`
+	SuccessCount    int    `json:"success_count"`
+	OutOfStockCount int    `json:"out_of_stock_count"`
+	FailCount       int    `json:"fail_count"`
+	Result          string `json:"result"`
+	Error           string `json:"error,omitempty"`
+}
+
+type runtimeMonitor struct {
+	mu sync.RWMutex
+
+	logs      []runtimeLogEntry
+	logCap    int
+	nextLogID int64
+	logCarry  string
+
+	runSeq int64
+
+	running          bool
+	runID            int64
+	runLabel         string
+	runStartedAt     time.Time
+	runUpdatedAt     time.Time
+	runEndedAt       time.Time
+	totalGroups      int
+	doneGroups       int
+	totalItems       int
+	doneItems        int
+	successCount     int
+	outOfStockCount  int
+	failCount        int
+	pendingRetry     int
+	currentGroupURL  string
+	currentGroupIdx  int
+	currentGroupSize int
+	currentTask      runtimeTask
+	lastResult       string
+	lastError        string
+	failureBuckets   map[string]int
+	recentRuns       []runtimeCollectRunSummary
+	recentRunCap     int
+}
+
+func newRuntimeMonitor(logCap, recentRunCap int) *runtimeMonitor {
+	if logCap < 200 {
+		logCap = 200
+	}
+	if recentRunCap < 5 {
+		recentRunCap = 5
+	}
+	return &runtimeMonitor{
+		logCap:       logCap,
+		recentRunCap: recentRunCap,
+		logs:         make([]runtimeLogEntry, 0, logCap),
+		failureBuckets: map[string]int{
+			"connectivity": 0,
+			"waf403":       0,
+			"regex":        0,
+			"other":        0,
+		},
+	}
+}
+
+func (m *runtimeMonitor) appendLogBytes(p []byte) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.logCarry += string(p)
+	for {
+		idx := strings.IndexByte(m.logCarry, '\n')
+		if idx < 0 {
+			break
+		}
+		line := strings.TrimRight(m.logCarry[:idx], "\r")
+		m.logCarry = m.logCarry[idx+1:]
+		m.appendLogLineLocked(line)
+	}
+}
+
+func (m *runtimeMonitor) appendLogLineLocked(line string) {
+	line = strings.TrimSpace(line)
+	if line == "" {
+		return
+	}
+	m.nextLogID++
+	m.logs = append(m.logs, runtimeLogEntry{
+		ID:   m.nextLogID,
+		TS:   chinaNow().Format("2006-01-02 15:04:05"),
+		Line: line,
+	})
+	if len(m.logs) > m.logCap {
+		m.logs = m.logs[len(m.logs)-m.logCap:]
+	}
+}
+
+func (m *runtimeMonitor) beginCollectRun(runLabel string, totalGroups, totalItems int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.runSeq++
+	m.running = true
+	m.runID = m.runSeq
+	m.runLabel = runLabel
+	m.runStartedAt = chinaNow()
+	m.runUpdatedAt = m.runStartedAt
+	m.runEndedAt = time.Time{}
+	m.totalGroups = totalGroups
+	m.doneGroups = 0
+	m.totalItems = totalItems
+	m.doneItems = 0
+	m.successCount = 0
+	m.outOfStockCount = 0
+	m.failCount = 0
+	m.pendingRetry = 0
+	m.currentGroupURL = ""
+	m.currentGroupIdx = 0
+	m.currentGroupSize = 0
+	m.currentTask = runtimeTask{}
+	m.lastResult = ""
+	m.lastError = ""
+	m.failureBuckets = map[string]int{
+		"connectivity": 0,
+		"waf403":       0,
+		"regex":        0,
+		"other":        0,
+	}
+}
+
+func (m *runtimeMonitor) setCollectGroup(idx, total, groupSize int, groupURL string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.currentGroupIdx = idx
+	m.totalGroups = total
+	m.currentGroupSize = groupSize
+	m.currentGroupURL = groupURL
+	m.runUpdatedAt = chinaNow()
+}
+
+func (m *runtimeMonitor) finishCollectGroup() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.doneGroups++
+	m.runUpdatedAt = chinaNow()
+}
+
+func (m *runtimeMonitor) setCurrentTask(p Product, phase string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.currentTask = runtimeTask{
+		Worker:    "collector-1",
+		ProductID: p.ID,
+		Product:   p.Name,
+		Store:     p.StoreName,
+		Phase:     phase,
+		UpdatedAt: chinaNow().Format("2006-01-02 15:04:05"),
+	}
+	m.runUpdatedAt = chinaNow()
+}
+
+func (m *runtimeMonitor) clearCurrentTask() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.currentTask = runtimeTask{}
+	m.runUpdatedAt = chinaNow()
+}
+
+func (m *runtimeMonitor) setPendingRetry(n int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.pendingRetry = n
+	m.runUpdatedAt = chinaNow()
+}
+
+func classifyRuntimeFailure(errText string) string {
+	s := strings.ToLower(strings.TrimSpace(errText))
+	switch {
+	case strings.Contains(s, "connection refused"),
+		strings.Contains(s, "i/o timeout"),
+		strings.Contains(s, "context deadline exceeded"),
+		strings.Contains(s, "client.timeout exceeded"),
+		strings.Contains(s, "no such host"),
+		strings.Contains(s, "network is unreachable"),
+		strings.Contains(s, "flaresolverr 不可用("):
+		return "connectivity"
+	case strings.Contains(s, "http 状态码异常: 403"),
+		strings.Contains(s, "just a moment"),
+		strings.Contains(s, "cloudflare"):
+		return "waf403"
+	case strings.Contains(s, "未匹配到字段"),
+		strings.Contains(s, "正则无效"),
+		strings.Contains(s, "解析价格失败"):
+		return "regex"
+	default:
+		return "other"
+	}
+}
+
+func (m *runtimeMonitor) markItemResult(status string, errText string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.doneItems++
+	switch status {
+	case "success":
+		m.successCount++
+	case "out_of_stock":
+		m.outOfStockCount++
+	default:
+		m.failCount++
+		b := classifyRuntimeFailure(errText)
+		m.failureBuckets[b] = m.failureBuckets[b] + 1
+		m.lastError = strings.TrimSpace(errText)
+	}
+	m.runUpdatedAt = chinaNow()
+}
+
+func (m *runtimeMonitor) finishCollectRun(result string, runErr error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.running = false
+	m.runEndedAt = chinaNow()
+	m.runUpdatedAt = m.runEndedAt
+	m.lastResult = result
+	if runErr != nil {
+		m.lastError = strings.TrimSpace(runErr.Error())
+	}
+	duration := m.runEndedAt.Sub(m.runStartedAt)
+	sum := runtimeCollectRunSummary{
+		RunID:           m.runID,
+		RunLabel:        m.runLabel,
+		StartedAt:       m.runStartedAt.Format("2006-01-02 15:04:05"),
+		EndedAt:         m.runEndedAt.Format("2006-01-02 15:04:05"),
+		DurationMS:      duration.Milliseconds(),
+		TotalItems:      m.totalItems,
+		SuccessCount:    m.successCount,
+		OutOfStockCount: m.outOfStockCount,
+		FailCount:       m.failCount,
+		Result:          result,
+	}
+	if runErr != nil {
+		sum.Error = runErr.Error()
+	}
+	m.recentRuns = append([]runtimeCollectRunSummary{sum}, m.recentRuns...)
+	if len(m.recentRuns) > m.recentRunCap {
+		m.recentRuns = m.recentRuns[:m.recentRunCap]
+	}
+	m.currentTask = runtimeTask{}
+	m.pendingRetry = 0
+}
+
+func (m *runtimeMonitor) snapshot() map[string]any {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	cbDisabledTill := ""
+	cbFails := 0
+	flareSolverrCB.mu.Lock()
+	cbFails = flareSolverrCB.fails
+	disabledTill := flareSolverrCB.disabledTill
+	flareSolverrCB.mu.Unlock()
+	if !disabledTill.IsZero() {
+		cbDisabledTill = disabledTill.In(chinaLoc).Format("2006-01-02 15:04:05")
+	}
+	now := chinaNow()
+	runForMS := int64(0)
+	if m.running && !m.runStartedAt.IsZero() {
+		runForMS = now.Sub(m.runStartedAt).Milliseconds()
+	}
+	failBuckets := map[string]int{
+		"connectivity": m.failureBuckets["connectivity"],
+		"waf403":       m.failureBuckets["waf403"],
+		"regex":        m.failureBuckets["regex"],
+		"other":        m.failureBuckets["other"],
+	}
+	recentRuns := make([]runtimeCollectRunSummary, len(m.recentRuns))
+	copy(recentRuns, m.recentRuns)
+	task := m.currentTask
+	activeTasks := []runtimeTask{}
+	if m.running && task.ProductID > 0 {
+		activeTasks = append(activeTasks, task)
+	}
+	return map[string]any{
+		"collect_running":      m.running,
+		"collect_lock_running": collectRunning.Load(),
+		"run_id":               m.runID,
+		"run_label":            m.runLabel,
+		"run_started_at":       formatRuntimeTime(m.runStartedAt),
+		"run_updated_at":       formatRuntimeTime(m.runUpdatedAt),
+		"run_ended_at":         formatRuntimeTime(m.runEndedAt),
+		"run_for_ms":           runForMS,
+		"total_groups":         m.totalGroups,
+		"done_groups":          m.doneGroups,
+		"total_items":          m.totalItems,
+		"done_items":           m.doneItems,
+		"success_count":        m.successCount,
+		"out_of_stock_count":   m.outOfStockCount,
+		"fail_count":           m.failCount,
+		"pending_retry":        m.pendingRetry,
+		"current_group_url":    m.currentGroupURL,
+		"current_group_index":  m.currentGroupIdx,
+		"current_group_size":   m.currentGroupSize,
+		"active_workers":       len(activeTasks),
+		"active_tasks":         activeTasks,
+		"last_result":          m.lastResult,
+		"last_error":           m.lastError,
+		"fail_buckets":         failBuckets,
+		"recent_runs":          recentRuns,
+		"goroutines":           runtime.NumGoroutine(),
+		"flaresolverr_enabled": useFlareSolverrFallback(),
+		"flaresolverr_url":     flareSolverrURL(),
+		"flaresolverr_breaker": map[string]any{
+			"fails":         cbFails,
+			"disabled_till": cbDisabledTill,
+		},
+		"verbose_log": verboseLogEnabled.Load(),
+	}
+}
+
+func formatRuntimeTime(t time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	return t.In(chinaLoc).Format("2006-01-02 15:04:05")
+}
+
+func (m *runtimeMonitor) logsSince(sinceID int64, limit int) ([]runtimeLogEntry, int64) {
+	if limit <= 0 {
+		limit = 200
+	}
+	if limit > 1000 {
+		limit = 1000
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := make([]runtimeLogEntry, 0, limit)
+	for i := len(m.logs) - 1; i >= 0; i-- {
+		e := m.logs[i]
+		if e.ID <= sinceID {
+			break
+		}
+		out = append(out, e)
+		if len(out) >= limit {
+			break
+		}
+	}
+	for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
+		out[i], out[j] = out[j], out[i]
+	}
+	return out, m.nextLogID
+}
 
 func (e *httpStatusError) Error() string {
 	return fmt.Sprintf("HTTP 状态码异常: %d, body=%q", e.Code, e.Body)
@@ -229,6 +601,7 @@ func setupLogging(dir string) (*dailyLogWriter, error) {
 }
 
 func (w *dailyLogWriter) Write(p []byte) (int, error) {
+	runtimeMon.appendLogBytes(p)
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if err := w.rotateIfNeeded(chinaNow()); err != nil {
@@ -661,6 +1034,11 @@ func migrate(db *sql.DB) error {
 			FOREIGN KEY(product_id) REFERENCES products(id)
 		);`,
 		`CREATE INDEX IF NOT EXISTS idx_fetch_logs_pid_time ON fetch_logs(product_id, fetched_at DESC, id DESC);`,
+		`CREATE TABLE IF NOT EXISTS store_options (
+			name TEXT PRIMARY KEY,
+			created_at TEXT NOT NULL DEFAULT (datetime('now', '+8 hours')),
+			updated_at TEXT NOT NULL DEFAULT (datetime('now', '+8 hours'))
+		);`,
 	}
 
 	for _, stmt := range stmts {
@@ -707,6 +1085,32 @@ func migrate(db *sql.DB) error {
 		return err
 	}
 	if err := ensureMerchantUpdateNormalizationMigration(db); err != nil {
+		return err
+	}
+	if err := ensureStoreOptionsInit(db); err != nil {
+		return err
+	}
+	return nil
+}
+
+func ensureStoreOptionsInit(db *sql.DB) error {
+	var cnt int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM store_options`).Scan(&cnt); err != nil {
+		return err
+	}
+	// 只在空表时初始化，避免用户删除后的店铺选项在重启时被自动加回。
+	if cnt > 0 {
+		return nil
+	}
+	if _, err := db.Exec(`INSERT OR IGNORE INTO store_options(name) VALUES
+		('Galaxy 銀河攝影器材'),
+		('順星數碼')`); err != nil {
+		return err
+	}
+	if _, err := db.Exec(`INSERT OR IGNORE INTO store_options(name)
+		SELECT DISTINCT TRIM(store_name)
+		FROM products
+		WHERE IFNULL(TRIM(store_name), '') <> ''`); err != nil {
 		return err
 	}
 	return nil
@@ -945,6 +1349,7 @@ func (s *collectRunState) markOutOfStock(db *sql.DB, p Product, err error) {
 	s.outOfStockCount++
 	_ = insertFetchLog(db, p.ID, false, err.Error())
 	_ = updateLastFetchStatus(db, p.ID, false, err.Error())
+	runtimeMon.markItemResult("out_of_stock", err.Error())
 }
 
 func (s *collectRunState) markFailure(db *sql.DB, p Product, errText string) {
@@ -957,6 +1362,7 @@ func (s *collectRunState) markFailure(db *sql.DB, p Product, errText string) {
 	})
 	_ = insertFetchLog(db, p.ID, false, errText)
 	_ = updateLastFetchStatus(db, p.ID, false, errText)
+	runtimeMon.markItemResult("failed", errText)
 }
 
 func (s *collectRunState) markSuccess(db *sql.DB, p Product, got FetchResult, phase string) {
@@ -968,6 +1374,7 @@ func (s *collectRunState) markSuccess(db *sql.DB, p Product, got FetchResult, ph
 	_ = insertFetchLog(db, p.ID, true, "")
 	_ = updateLastFetchStatus(db, p.ID, true, "")
 	s.successCount++
+	runtimeMon.markItemResult("success", "")
 }
 
 func (s *collectRunState) inspectFetchErr(err error) {
@@ -1028,8 +1435,11 @@ func runCollectForProducts(db *sql.DB, products []Product, runLabel string) erro
 	log.Printf("[collect][%s] 本轮采集开始，日期=%s，商品数量=%d", runLabel, today, len(products))
 	urlGroups := groupProductsByURL(products)
 	log.Printf("[collect][%s] 本轮按URL分组后需访问页面数=%d", runLabel, len(urlGroups))
+	runtimeMon.beginCollectRun(runLabel, len(urlGroups), len(products))
+	defer runtimeMon.clearCurrentTask()
 	state := newCollectRunState(runLabel)
 	for i, g := range urlGroups {
+		runtimeMon.setCollectGroup(i+1, len(urlGroups), len(g.Items), g.URL)
 		if i > 0 {
 			delay := collectItemDelay()
 			if delay > 0 {
@@ -1039,10 +1449,12 @@ func runCollectForProducts(db *sql.DB, products []Product, runLabel string) erro
 		}
 		sample := g.Items[0]
 		debugLogf("[collect][%s][%d/%d][url=%s] 开始采集，分组商品数=%d", runLabel, i+1, len(urlGroups), g.URL, len(g.Items))
+		runtimeMon.setCurrentTask(sample, "抓取页面")
 		content, err := fetchProductPageContent(sample)
 		if err != nil {
 			log.Printf("[collect][%s][url=%s] 页面抓取失败: %v", runLabel, g.URL, err)
 			for _, p := range g.Items {
+				runtimeMon.setCurrentTask(p, "处理抓取失败")
 				if isOutOfStockError(err) {
 					state.markOutOfStock(db, p, err)
 					continue
@@ -1050,12 +1462,14 @@ func runCollectForProducts(db *sql.DB, products []Product, runLabel string) erro
 				state.markFailure(db, p, err.Error())
 			}
 			state.inspectFetchErr(err)
+			runtimeMon.finishCollectGroup()
 			continue
 		}
 
 		groupSuccess := 0
 		pendingFailures := make([]pendingCollectFailure, 0, 2)
 		for _, p := range g.Items {
+			runtimeMon.setCurrentTask(p, "解析页面")
 			got, perr := parseFetchResultFromContent(content, p)
 			if perr != nil {
 				if isOutOfStockError(perr) {
@@ -1070,6 +1484,7 @@ func runCollectForProducts(db *sql.DB, products []Product, runLabel string) erro
 				continue
 			}
 			debugLogf("[collect][%s][%s] 抓取完成，准备写入数据库", runLabel, p.Name)
+			runtimeMon.setCurrentTask(p, "写入数据库")
 			err = upsertDailyPrice(db, p.ID, today, p.StoreName, got.Price, got.RawPrice, got.MerchantUpdate, p.URL)
 			if err != nil {
 				log.Printf("[collect][%s][%s] 写入失败: %v", runLabel, p.Name, err)
@@ -1085,8 +1500,10 @@ func runCollectForProducts(db *sql.DB, products []Product, runLabel string) erro
 		if len(pendingFailures) > 0 && groupSuccess > 0 {
 			retryDelay := collectPartialRetryDelay()
 			log.Printf("[collect][%s][url=%s] 检测到单店失败，%s 后补抓失败店铺，数量=%d", runLabel, g.URL, retryDelay.String(), len(pendingFailures))
+			runtimeMon.setPendingRetry(len(pendingFailures))
 			time.Sleep(retryDelay)
 
+			runtimeMon.setCurrentTask(sample, "补抓页面")
 			retryContent, retryErr := fetchProductPageContent(sample)
 			if retryErr != nil {
 				log.Printf("[collect][%s][url=%s] 单店失败补抓页面失败: %v", runLabel, g.URL, retryErr)
@@ -1096,6 +1513,7 @@ func runCollectForProducts(db *sql.DB, products []Product, runLabel string) erro
 				}
 			} else {
 				for _, pf := range pendingFailures {
+					runtimeMon.setCurrentTask(pf.product, "补抓解析")
 					got, perr := parseFetchResultFromContent(retryContent, pf.product)
 					if perr != nil {
 						finalErr := fmt.Sprintf("首次解析失败: %v; 补抓解析失败: %v", pf.firstErr, perr)
@@ -1107,6 +1525,7 @@ func runCollectForProducts(db *sql.DB, products []Product, runLabel string) erro
 						state.markFailure(db, pf.product, finalErr)
 						continue
 					}
+					runtimeMon.setCurrentTask(pf.product, "补抓写入")
 					if werr := upsertDailyPrice(db, pf.product.ID, today, pf.product.StoreName, got.Price, got.RawPrice, got.MerchantUpdate, pf.product.URL); werr != nil {
 						finalErr := fmt.Sprintf("首次解析失败: %v; 补抓写入失败: %v", pf.firstErr, werr)
 						state.markFailure(db, pf.product, finalErr)
@@ -1115,19 +1534,26 @@ func runCollectForProducts(db *sql.DB, products []Product, runLabel string) erro
 					state.markSuccess(db, pf.product, got, "补抓")
 				}
 			}
+			runtimeMon.setPendingRetry(0)
 		} else if len(pendingFailures) > 0 {
 			for _, pf := range pendingFailures {
 				state.markFailure(db, pf.product, pf.firstErr.Error())
 			}
 		}
+		runtimeMon.finishCollectGroup()
 	}
 	log.Printf("[collect][%s] 本轮采集结束: success=%d out_of_stock=%d failed=%d", runLabel, state.successCount, state.outOfStockCount, state.failCount)
 	if state.successCount == 0 && state.blockedByWAF {
-		return fmt.Errorf("当前被 Cloudflare 挑战拦截（Just a moment），请启用 FlareSolverr 或手动验证会话")
+		err := fmt.Errorf("当前被 Cloudflare 挑战拦截（Just a moment），请启用 FlareSolverr 或手动验证会话")
+		runtimeMon.finishCollectRun("failed", err)
+		return err
 	}
 	if state.successCount == 0 && state.failCount > 0 {
-		return fmt.Errorf("本轮采集无成功记录")
+		err := fmt.Errorf("本轮采集无成功记录")
+		runtimeMon.finishCollectRun("failed", err)
+		return err
 	}
+	runtimeMon.finishCollectRun("success", nil)
 	return nil
 }
 
@@ -2207,7 +2633,12 @@ func must(err error) {
 
 func (a *App) loadTemplates() error {
 	root := envOrDefault("TEMPLATE_DIR", "./templates")
-	t, err := template.ParseFiles(filepath.Join(root, "index.html"), filepath.Join(root, "product.html"))
+	t, err := template.ParseFiles(
+		filepath.Join(root, "index.html"),
+		filepath.Join(root, "product.html"),
+		filepath.Join(root, "runtime.html"),
+		filepath.Join(root, "fx.html"),
+	)
 	if err != nil {
 		return err
 	}
@@ -2221,10 +2652,17 @@ func (a *App) serve(addr string) error {
 	appMux.Handle("/static/", http.StripPrefix("/static/", http.FileServer(http.Dir("./static"))))
 	appMux.HandleFunc("/", a.handleIndex)
 	appMux.HandleFunc("/product/", a.handleProductPage)
+	appMux.HandleFunc("/runtime", a.handleRuntimePage)
+	appMux.HandleFunc("/fx", a.handleFXPage)
 	appMux.HandleFunc("/api/products", a.handleProducts)
 	appMux.HandleFunc("/api/products/", a.handleProductHistory)
 	appMux.HandleFunc("/api/collect", a.handleCollect)
 	appMux.HandleFunc("/api/fx/hkd-cny/today", a.handleTodayFX)
+	appMux.HandleFunc("/api/fx/hkd-cny/history", a.handleFXHistory)
+	appMux.HandleFunc("/api/fx/hkd-cny/chart", a.handleFXChart)
+	appMux.HandleFunc("/api/store-options", a.handleStoreOptions)
+	appMux.HandleFunc("/api/runtime/status", a.handleRuntimeStatus)
+	appMux.HandleFunc("/api/runtime/logs", a.handleRuntimeLogs)
 
 	if a.basePath == "" {
 		mux.Handle("/", appMux)
@@ -2344,6 +2782,28 @@ func (a *App) handleProductPage(w http.ResponseWriter, r *http.Request) {
 		"BasePath":    a.basePath,
 	}
 	if err := a.templates.ExecuteTemplate(w, "product.html", data); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	}
+}
+
+func (a *App) handleRuntimePage(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/runtime" && r.URL.Path != "/runtime/" {
+		http.NotFound(w, r)
+		return
+	}
+	data := map[string]any{"BasePath": a.basePath}
+	if err := a.templates.ExecuteTemplate(w, "runtime.html", data); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	}
+}
+
+func (a *App) handleFXPage(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/fx" && r.URL.Path != "/fx/" {
+		http.NotFound(w, r)
+		return
+	}
+	data := map[string]any{"BasePath": a.basePath}
+	if err := a.templates.ExecuteTemplate(w, "fx.html", data); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
 }
@@ -2514,6 +2974,9 @@ func (a *App) handleAddProduct(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, ierr.Message, ierr.Status)
 		return
 	}
+	if err := addStoreOption(a.db, prepared.StoreName); err != nil {
+		log.Printf("[add-product] 写入店铺选项失败(忽略): store=%s err=%v", prepared.StoreName, err)
+	}
 
 	if handled := a.tryDedupAddProductAndCollect(w, start, prepared); handled {
 		return
@@ -2586,7 +3049,7 @@ func parseAddProductInput(r *http.Request) (addProductReq, *addProductInputErr) 
 			Message: "仅支持 price.com.hk 商品链接",
 		}
 	}
-	store := strings.TrimSpace(in.StoreName)
+	store := normalizeStoreName(in.StoreName)
 	if store == "" {
 		store = "Galaxy 銀河攝影器材"
 	}
@@ -2966,18 +3429,66 @@ func normalizeProductDisplayName(name string) string {
 	return strings.TrimSpace(s)
 }
 
+func normalizeStoreName(name string) string {
+	return strings.Join(strings.Fields(strings.TrimSpace(name)), " ")
+}
+
+func listStoreOptions(db *sql.DB) ([]string, error) {
+	rows, err := db.Query(`SELECT name FROM store_options ORDER BY name`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]string, 0, 16)
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		name = normalizeStoreName(name)
+		if name == "" {
+			continue
+		}
+		out = append(out, name)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func addStoreOption(db *sql.DB, name string) error {
+	n := normalizeStoreName(name)
+	if n == "" {
+		return fmt.Errorf("店铺名不能为空")
+	}
+	if utf8.RuneCountInString(n) > 80 {
+		return fmt.Errorf("店铺名过长")
+	}
+	_, err := db.Exec(`INSERT INTO store_options(name, created_at, updated_at)
+		VALUES(?, datetime('now', '+8 hours'), datetime('now', '+8 hours'))
+		ON CONFLICT(name) DO UPDATE SET updated_at=datetime('now', '+8 hours')`, n)
+	return err
+}
+
+func deleteStoreOption(db *sql.DB, name string) error {
+	n := normalizeStoreName(name)
+	if n == "" {
+		return fmt.Errorf("店铺名不能为空")
+	}
+	_, err := db.Exec(`DELETE FROM store_options WHERE name = ?`, n)
+	return err
+}
+
 func (a *App) handleDeleteProduct(w http.ResponseWriter, r *http.Request, idStr string) {
-	type req struct {
-		Confirm string `json:"confirm"`
-	}
-	var in req
-	if err := json.NewDecoder(io.LimitReader(r.Body, 8*1024)).Decode(&in); err != nil {
-		http.Error(w, "请求体格式错误", http.StatusBadRequest)
-		return
-	}
-	if strings.TrimSpace(strings.ToUpper(in.Confirm)) != "DELETE" {
-		http.Error(w, "确认码错误", http.StatusBadRequest)
-		return
+	// 兼容旧客户端: 允许可选 JSON 请求体，但不再要求输入确认码。
+	if r.Body != nil {
+		var ignore map[string]any
+		decErr := json.NewDecoder(io.LimitReader(r.Body, 8*1024)).Decode(&ignore)
+		if decErr != nil && !errors.Is(decErr, io.EOF) {
+			http.Error(w, "请求体格式错误", http.StatusBadRequest)
+			return
+		}
 	}
 	pid, err := strconv.ParseInt(strings.TrimSpace(idStr), 10, 64)
 	if err != nil || pid <= 0 {
@@ -3161,6 +3672,214 @@ func (a *App) handleTodayFX(w http.ResponseWriter, r *http.Request) {
 		"rate":   rate,
 		"date":   day,
 		"source": source,
+	})
+}
+
+func (a *App) handleStoreOptions(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		list, err := listStoreOptions(a.db)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, map[string]any{"stores": list})
+		return
+	case http.MethodPost:
+		var in struct {
+			Name string `json:"name"`
+		}
+		if err := json.NewDecoder(io.LimitReader(r.Body, 16*1024)).Decode(&in); err != nil {
+			http.Error(w, "请求体格式错误", http.StatusBadRequest)
+			return
+		}
+		name := normalizeStoreName(in.Name)
+		if name == "" {
+			http.Error(w, "店铺名不能为空", http.StatusBadRequest)
+			return
+		}
+		if err := addStoreOption(a.db, name); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, map[string]any{"status": "ok", "name": name})
+		return
+	case http.MethodDelete:
+		name := normalizeStoreName(r.URL.Query().Get("name"))
+		if name == "" {
+			http.Error(w, "name 不能为空", http.StatusBadRequest)
+			return
+		}
+		if err := deleteStoreOption(a.db, name); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, map[string]any{"status": "ok", "name": name})
+		return
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (a *App) handleFXHistory(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	page := 1
+	if raw := strings.TrimSpace(r.URL.Query().Get("page")); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n > 0 {
+			page = n
+		}
+	}
+	pageSize := 20
+	if raw := strings.TrimSpace(r.URL.Query().Get("page_size")); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil {
+			pageSize = n
+		}
+	}
+	if pageSize < 1 {
+		pageSize = 20
+	}
+	if pageSize > 200 {
+		pageSize = 200
+	}
+
+	var total int
+	if err := a.db.QueryRow(`SELECT COUNT(*) FROM exchange_rates WHERE base_currency = 'HKD' AND quote_currency = 'CNY'`).Scan(&total); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	offset := (page - 1) * pageSize
+	if offset < 0 {
+		offset = 0
+	}
+
+	type fxRow struct {
+		RateDate  string  `json:"rate_date"`
+		Rate      float64 `json:"rate"`
+		Source    string  `json:"source"`
+		UpdatedAt string  `json:"updated_at"`
+	}
+	rows, err := a.db.Query(`SELECT rate_date, rate, source, updated_at
+		FROM exchange_rates
+		WHERE base_currency = 'HKD' AND quote_currency = 'CNY'
+		ORDER BY rate_date DESC
+		LIMIT ? OFFSET ?`, pageSize, offset)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	out := make([]fxRow, 0, pageSize)
+	for rows.Next() {
+		var x fxRow
+		if err := rows.Scan(&x.RateDate, &x.Rate, &x.Source, &x.UpdatedAt); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		out = append(out, x)
+	}
+	if err := rows.Err(); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, map[string]any{
+		"pair":      "HKD/CNY",
+		"page":      page,
+		"page_size": pageSize,
+		"total":     total,
+		"rows":      out,
+	})
+}
+
+func (a *App) handleFXChart(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	days := 180
+	if raw := strings.TrimSpace(r.URL.Query().Get("days")); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil {
+			days = n
+		}
+	}
+	if days < 7 {
+		days = 7
+	}
+	if days > 1000 {
+		days = 1000
+	}
+
+	type fxPoint struct {
+		RateDate string  `json:"rate_date"`
+		Rate     float64 `json:"rate"`
+	}
+	rows, err := a.db.Query(`SELECT rate_date, rate
+		FROM exchange_rates
+		WHERE base_currency = 'HKD' AND quote_currency = 'CNY'
+		ORDER BY rate_date DESC
+		LIMIT ?`, days)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	tmp := make([]fxPoint, 0, days)
+	for rows.Next() {
+		var p fxPoint
+		if err := rows.Scan(&p.RateDate, &p.Rate); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		tmp = append(tmp, p)
+	}
+	if err := rows.Err(); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	// Reverse to ascending date order for line chart rendering.
+	points := make([]fxPoint, len(tmp))
+	for i := range tmp {
+		points[len(tmp)-1-i] = tmp[i]
+	}
+	writeJSON(w, map[string]any{
+		"pair":   "HKD/CNY",
+		"points": points,
+	})
+}
+
+func (a *App) handleRuntimeStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	writeJSON(w, runtimeMon.snapshot())
+}
+
+func (a *App) handleRuntimeLogs(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	limit := 200
+	if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil {
+			limit = n
+		}
+	}
+	var sinceID int64
+	if raw := strings.TrimSpace(r.URL.Query().Get("since_id")); raw != "" {
+		if n, err := strconv.ParseInt(raw, 10, 64); err == nil && n >= 0 {
+			sinceID = n
+		}
+	}
+	lines, latestID := runtimeMon.logsSince(sinceID, limit)
+	writeJSON(w, map[string]any{
+		"lines":     lines,
+		"latest_id": latestID,
 	})
 }
 

@@ -1,0 +1,207 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>汇率查看</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=Noto+Sans+SC:wght@400;500;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="{{.BasePath}}/static/style.css" />
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body>
+  <div class="glow glow-a"></div>
+  <div class="glow glow-b"></div>
+
+  <main class="container">
+    <header class="hero card product-hero">
+      <div>
+        <p class="tag">FX MONITOR</p>
+        <h1>汇率查看（HKD/CNY）</h1>
+        <p class="sub">顶部展示汇率变化曲线，底部倒序分页查看历史汇率。</p>
+      </div>
+      <div class="hero-nav-links">
+        <a class="btn-link" href="{{.BasePath}}/">返回总览</a>
+        <a class="btn-link" href="{{.BasePath}}/runtime">采集监控</a>
+      </div>
+    </header>
+
+    <section class="card chart-card">
+      <canvas id="fxChart"></canvas>
+    </section>
+
+    <section class="card">
+      <div class="section-head">
+        <h2>汇率台账</h2>
+        <div class="runtime-actions">
+          <select id="pageSize" class="ui-field ui-field-inline">
+            <option value="20" selected>每页 20</option>
+            <option value="50">每页 50</option>
+            <option value="100">每页 100</option>
+          </select>
+          <button id="refreshBtn" class="btn-link">刷新</button>
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>日期</th>
+              <th>汇率</th>
+              <th>来源</th>
+              <th>更新时间</th>
+            </tr>
+          </thead>
+          <tbody id="fxRows"></tbody>
+        </table>
+      </div>
+      <div class="ledger-pager">
+        <button id="fxPrev" class="btn-mini">上一页</button>
+        <span id="fxPageInfo" class="muted-mini">第 1/1 页</span>
+        <button id="fxNext" class="btn-mini">下一页</button>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    const BASE_PATH = '{{.BasePath}}';
+    function withBase(path) {
+      return `${BASE_PATH}${path}`;
+    }
+
+    let page = 1;
+    let pageSize = 20;
+    let total = 0;
+    let chartInstance = null;
+
+    function escapeHTML(input) {
+      return String(input ?? '')
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;')
+        .replaceAll("'", '&#39;');
+    }
+
+    function formatDateTimeCN(input) {
+      if (!input) return '-';
+      const s = String(input).replace('T', ' ').replace('Z', '');
+      const m = s.match(/\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}/);
+      if (m) return m[0];
+      const d = new Date(input);
+      if (Number.isNaN(d.getTime())) return s;
+      return new Intl.DateTimeFormat('zh-CN', {
+        timeZone: 'Asia/Shanghai',
+        hour12: false,
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit',
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit'
+      }).format(d).replace(/\//g, '-');
+    }
+
+    async function loadChart() {
+      const res = await fetch(withBase('/api/fx/hkd-cny/chart?days=180'));
+      if (!res.ok) throw new Error(await res.text());
+      const out = await res.json();
+      const points = Array.isArray(out.points) ? out.points : [];
+      const labels = points.map((x) => x.rate_date);
+      const values = points.map((x) => Number(x.rate || 0));
+
+      if (chartInstance) chartInstance.destroy();
+      chartInstance = new Chart(document.getElementById('fxChart'), {
+        type: 'line',
+        data: {
+          labels,
+          datasets: [
+            {
+              label: 'HKD/CNY',
+              data: values,
+              borderColor: '#c68658',
+              backgroundColor: 'rgba(198, 134, 88, 0.18)',
+              borderWidth: 2.4,
+              pointRadius: 0,
+              fill: true,
+              tension: 0.22,
+              spanGaps: true
+            }
+          ]
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          plugins: {
+            legend: {
+              labels: { color: '#6f5c4a' }
+            }
+          },
+          scales: {
+            x: {
+              ticks: { color: '#8a7662' },
+              grid: { color: 'rgba(176, 152, 130, 0.22)' }
+            },
+            y: {
+              beginAtZero: false,
+              ticks: { color: '#8a7662' },
+              grid: { color: 'rgba(176, 152, 130, 0.22)' }
+            }
+          }
+        }
+      });
+    }
+
+    async function loadPage() {
+      const q = new URLSearchParams();
+      q.set('page', String(page));
+      q.set('page_size', String(pageSize));
+      const res = await fetch(withBase(`/api/fx/hkd-cny/history?${q.toString()}`));
+      if (!res.ok) throw new Error(await res.text());
+      const out = await res.json();
+      total = Number(out.total || 0);
+      const rows = Array.isArray(out.rows) ? out.rows : [];
+      const pages = Math.max(1, Math.ceil(total / pageSize));
+      if (page > pages) {
+        page = pages;
+        return loadPage();
+      }
+
+      document.getElementById('fxRows').innerHTML = rows.map((x, idx) => `
+        <tr style="animation-delay:${idx * 22}ms">
+          <td data-label="日期">${escapeHTML(x.rate_date || '-')}</td>
+          <td data-label="汇率"><span class="mono">${Number(x.rate || 0).toFixed(6)}</span></td>
+          <td data-label="来源">${escapeHTML(x.source || '-')}</td>
+          <td data-label="更新时间"><span class="muted-mini">${formatDateTimeCN(x.updated_at)}</span></td>
+        </tr>
+      `).join('') || '<tr><td colspan="4">暂无汇率数据</td></tr>';
+
+      document.getElementById('fxPageInfo').textContent = `第 ${page}/${pages} 页 · 共 ${total} 条`;
+      document.getElementById('fxPrev').disabled = page <= 1;
+      document.getElementById('fxNext').disabled = page >= pages;
+    }
+
+    document.getElementById('fxPrev').addEventListener('click', async () => {
+      page -= 1;
+      await loadPage();
+    });
+    document.getElementById('fxNext').addEventListener('click', async () => {
+      page += 1;
+      await loadPage();
+    });
+    document.getElementById('pageSize').addEventListener('change', async (e) => {
+      pageSize = Number(e.target.value || 20);
+      page = 1;
+      await loadPage();
+    });
+    document.getElementById('refreshBtn').addEventListener('click', async () => {
+      await Promise.all([loadChart(), loadPage()]);
+    });
+
+    Promise.all([loadChart(), loadPage()]).catch((e) => {
+      console.error(e);
+    });
+  </script>
+</body>
+</html>
