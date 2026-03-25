@@ -29,25 +29,36 @@ FROM alpine:3.21
 
 WORKDIR /app
 
+ARG INSTALL_BROWSER_DEPS=true
+
 RUN apk add --no-cache \
     ca-certificates \
-    chromium \
-    harfbuzz \
-    nss \
-    nodejs \
-    npm \
-    ttf-freefont \
+    tzdata \
+    && if [ "${INSTALL_BROWSER_DEPS}" = "true" ]; then \
+      apk add --no-cache \
+        chromium \
+        harfbuzz \
+        nss \
+        nodejs \
+        npm \
+        ttf-freefont; \
+    fi \
     && adduser -D -u 10001 appuser
 
 COPY --from=builder /out/price-monitor /app/price-monitor
+COPY package.json /app/package.json
+COPY package-lock.json /app/package-lock.json
 COPY templates /app/templates
 COPY static /app/static
 COPY config /app/config
 COPY scripts /app/scripts
-COPY package.json /app/package.json
 COPY docker-entrypoint.sh /app/docker-entrypoint.sh
 
-RUN npm install --omit=dev --no-audit --no-fund \
+RUN if [ "${INSTALL_BROWSER_DEPS}" = "true" ]; then \
+      npm ci --omit=dev --no-audit --no-fund; \
+    fi \
+    && cp /usr/share/zoneinfo/Asia/Shanghai /etc/localtime \
+    && echo "Asia/Shanghai" > /etc/timezone \
     && chmod +x /app/docker-entrypoint.sh \
     && mkdir -p /app/data /app/logs \
     && chown -R appuser:appuser /app
@@ -62,6 +73,7 @@ ENV LOG_DIR=/app/logs
 ENV COLLECT_TIMES=10:00,11:00,15:00
 ENV PUSH_TIMES=12:00
 ENV SCHEDULE_TZ=Asia/Shanghai
+ENV TZ=Asia/Shanghai
 ENV PLAYWRIGHT_BROWSER_PATH=/usr/bin/chromium
 ENV PLAYWRIGHT_HEADLESS=true
 

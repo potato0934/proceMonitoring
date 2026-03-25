@@ -1,0 +1,10 @@
+{
+  "name": "pricemonitor-playwright",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Playwright helper for price monitor browser fallback",
+  "license": "UNLICENSED",
+  "dependencies": {
+    "playwright-core": "^1.55.0"
+  }
+}

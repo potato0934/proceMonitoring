@@ -40,6 +40,11 @@
           <tbody id="ledger"></tbody>
         </table>
       </div>
+      <div class="ledger-pager">
+        <button id="ledgerPrev" class="btn-mini">上一页</button>
+        <span id="ledgerPageInfo" class="muted-mini">第 1/1 页</span>
+        <button id="ledgerNext" class="btn-mini">下一页</button>
+      </div>
     </section>
   </main>
 
@@ -51,6 +56,10 @@
 
     const productID = {{.ProductID}};
     const currency = 'HKD';
+    const LEDGER_PAGE_SIZE = 20;
+    let ledgerRows = [];
+    let ledgerPage = 1;
+    let ledgerFallbackRate = null;
 
     function fmtMoney(v) {
       if (typeof v !== 'number' || Number.isNaN(v)) return '-';
@@ -89,6 +98,7 @@
           fallbackRate = fx.rate;
         }
       }
+      ledgerFallbackRate = fallbackRate;
 
       const chartData = data.slice(-7);
       const labels = chartData.map(d => d.date);
@@ -146,7 +156,7 @@
             yCNY: {
               position: 'left',
               beginAtZero: false,
-              ticks: { color: '#9db2f2' },
+              ticks: { color: '#9db2f2', stepSize: 50 },
               grid: { color: 'rgba(126,152,228,0.2)' }
             },
             yHKD: {
@@ -159,7 +169,19 @@
         }
       });
 
-      document.getElementById('ledger').innerHTML = data.map((d, idx) => `
+      ledgerRows = [...data].sort((a, b) => String(b.date || '').localeCompare(String(a.date || '')));
+      ledgerPage = 1;
+      renderLedgerPage();
+    }
+
+    function renderLedgerPage() {
+      const total = ledgerRows.length;
+      const pages = Math.max(1, Math.ceil(total / LEDGER_PAGE_SIZE));
+      if (ledgerPage < 1) ledgerPage = 1;
+      if (ledgerPage > pages) ledgerPage = pages;
+      const start = (ledgerPage - 1) * LEDGER_PAGE_SIZE;
+      const rows = ledgerRows.slice(start, start + LEDGER_PAGE_SIZE);
+      document.getElementById('ledger').innerHTML = rows.map((d, idx) => `
         <tr style="animation-delay:${idx * 30}ms">
           <td data-label="日期">${d.date}</td>
           <td data-label="抓取时间"><span class="muted-mini">${formatDateTimeCN(d.recorded_at)}</span></td>
@@ -169,8 +191,8 @@
                 fmtMoney(
                   (typeof d.cny_price === 'number' && Number.isFinite(d.cny_price))
                     ? d.cny_price
-                    : (fallbackRate && typeof d.price === 'number' && Number.isFinite(d.price)
-                      ? Number((d.price * fallbackRate).toFixed(2))
+                    : (ledgerFallbackRate && typeof d.price === 'number' && Number.isFinite(d.price)
+                      ? Number((d.price * ledgerFallbackRate).toFixed(2))
                       : NaN)
                 )
               } CNY</div>
@@ -179,7 +201,20 @@
           </td>
         </tr>
       `).join('');
+
+      document.getElementById('ledgerPageInfo').textContent = `第 ${ledgerPage}/${pages} 页`;
+      document.getElementById('ledgerPrev').disabled = ledgerPage <= 1;
+      document.getElementById('ledgerNext').disabled = ledgerPage >= pages;
     }
+
+    document.getElementById('ledgerPrev').addEventListener('click', () => {
+      ledgerPage -= 1;
+      renderLedgerPage();
+    });
+    document.getElementById('ledgerNext').addEventListener('click', () => {
+      ledgerPage += 1;
+      renderLedgerPage();
+    });
 
     loadHistory();
   </script>

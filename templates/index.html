@@ -41,6 +41,7 @@
       <article class="card stat">
         <p class="stat-label">最后更新时间</p>
         <p class="stat-value" id="statLastUpdate">-</p>
+        <p class="stat-sub" id="statFxRate">今日汇率 -</p>
         <p class="stat-sub" id="statUpdatedToday">今日更新 0 件</p>
       </article>
     </section>
@@ -68,7 +69,6 @@
               <th>店铺</th>
               <th>最新价格</th>
               <th>手续费(1%)</th>
-              <th>商户更新</th>
               <th>采集状态</th>
               <th>操作</th>
             </tr>
@@ -172,6 +172,52 @@
       return { icon: '↓', cls: 'down', title: '较前日下降' };
     }
 
+    function isOutOfStockErrorText(errText) {
+      if (!errText) return false;
+      const text = String(errText);
+      const keywords = [
+        '无货', '無貨', '缺货', '缺貨', '售罄',
+        '請先查詢', '请先查询', '請查詢', '请查询',
+        '查詢中', '查询中', '待查詢', '待查询',
+        '預訂', '预订', '離線', '离线'
+      ];
+      return keywords.some((kw) => text.includes(kw));
+    }
+
+    function epochDayFromYMD(ymd) {
+      const m = String(ymd || '').match(/^(\d{4})-(\d{2})-(\d{2})$/);
+      if (!m) return null;
+      const y = Number(m[1]);
+      const mon = Number(m[2]);
+      const d = Number(m[3]);
+      return Math.floor(Date.UTC(y, mon - 1, d) / 86400000);
+    }
+
+    function staleAgeDays(priceYMD, todayYMD) {
+      const p = epochDayFromYMD(priceYMD);
+      const t = epochDayFromYMD(todayYMD);
+      if (p == null || t == null) return null;
+      return t - p;
+    }
+
+    function extractYMD(text) {
+      if (!text) return '';
+      const m = String(text).match(/\d{4}-\d{2}-\d{2}/);
+      return m ? m[0] : '';
+    }
+
+    function staleAgeLabel(ageDays) {
+      if (ageDays === 1) return '昨日';
+      if (ageDays >= 2) return `${ageDays}天前`;
+      return '非今日';
+    }
+
+    function staleLevelClass(ageDays) {
+      if (ageDays >= 4) return 'lv-3';
+      if (ageDays >= 2) return 'lv-2';
+      return 'lv-1';
+    }
+
     const modalEl = document.getElementById('uiModal');
     const modalTitleEl = document.getElementById('uiModalTitle');
     const modalMessageEl = document.getElementById('uiModalMessage');
@@ -228,7 +274,33 @@
 
     function renderRows(data, fxRate) {
       const tbody = document.getElementById('rows');
-      tbody.innerHTML = data.map((p, idx) => `
+      const today = todayYMDCN();
+      tbody.innerHTML = data.map((p, idx) => {
+        const latestPriceDate = formatYMD(p.latest_updated_at || p.latest_date);
+        const merchantUpdateDate = extractYMD(p.merchant_update || '');
+        const staleByCollect = p.latest_price != null && latestPriceDate && latestPriceDate !== today;
+        const staleByMerchant = p.latest_price != null && merchantUpdateDate && merchantUpdateDate !== today;
+        const isStalePrice = staleByCollect || staleByMerchant;
+        const collectAge = staleAgeDays(latestPriceDate, today);
+        const merchantAge = staleAgeDays(merchantUpdateDate, today);
+        const staleAge = Math.max(
+          staleByCollect && Number.isFinite(collectAge) ? collectAge : 0,
+          staleByMerchant && Number.isFinite(merchantAge) ? merchantAge : 0
+        );
+        const staleCls = isStalePrice ? 'stale' : '';
+        const staleTag = isStalePrice
+          ? `<span class="freshness-badge ${staleLevelClass(staleAge)}" title="采集日期：${escapeHTML(latestPriceDate || '-')}；商户更新：${escapeHTML(merchantUpdateDate || '-')}">${escapeHTML(staleAgeLabel(staleAge))}</span>`
+          : '';
+        const staleMetaLines = [];
+        staleMetaLines.push(`<div class="price-meta-date">采集日期 ${escapeHTML(latestPriceDate || '-')}</div>`);
+        staleMetaLines.push(`<div class="price-meta-date">商户更新 ${escapeHTML(merchantUpdateDate || '-')}</div>`);
+        const staleMeta = staleMetaLines.join('');
+        const isOutOfStock = p.last_fetch_ok !== 1 && isOutOfStockErrorText(p.last_fetch_error);
+        const fetchBadgeClass = p.last_fetch_ok === 1 ? 'ok' : (isOutOfStock ? 'oos' : 'fail');
+        const fetchBadgeText = p.last_fetch_ok === 1 ? '成功' : (isOutOfStock ? '无货' : '失败');
+        const fetchBadgeTitle = p.last_fetch_error ? ` title="${escapeHTML(p.last_fetch_error)}"` : '';
+        const showReasonBtn = p.last_fetch_ok !== 1 && p.last_fetch_error;
+        return `
         <tr style="animation-delay:${idx * 45}ms">
           <td data-label="ID"><span class="mono">#${p.id}</span></td>
           <td data-label="商品"><a href="${withBase(`/product/${p.id}`)}">${p.name}</a></td>
@@ -239,13 +311,15 @@
               : `
                 <div class="price-stack">
                   <div class="price-cny">
-                    ${(fxRate ? (p.latest_price * fxRate).toFixed(2) : '-')} CNY
+                    <span class="price-value ${staleCls}">${(fxRate ? (p.latest_price * fxRate).toFixed(2) : '-')} CNY</span>
                     ${(() => {
                       const t = trendMeta(p.latest_price, p.prev_price);
                       return `<span class="trend-icon ${t.cls}" title="${t.title}">${t.icon}</span>`;
                     })()}
+                    ${staleTag}
                   </div>
-                  <div class="price-hkd">${p.latest_price.toFixed(2)} ${p.currency}</div>
+                  <div class="price-hkd"><span class="price-value ${staleCls}">${p.latest_price.toFixed(2)} ${p.currency}</span></div>
+                  ${staleMeta}
                 </div>
               `
           }</td>
@@ -254,18 +328,18 @@
               ? '-'
               : `
                 <div class="price-stack">
-                  <div class="price-cny">${(fxRate ? (p.latest_price * 0.01 * fxRate).toFixed(2) : '-')} CNY</div>
-                  <div class="price-hkd">${(p.latest_price * 0.01).toFixed(2)} ${p.currency}</div>
+                  <div class="price-cny"><span class="price-value ${staleCls}">${(fxRate ? (p.latest_price * 0.01 * fxRate).toFixed(2) : '-')} CNY</span></div>
+                  <div class="price-hkd"><span class="price-value ${staleCls}">${(p.latest_price * 0.01).toFixed(2)} ${p.currency}</span></div>
                 </div>
               `
           }</td>
-          <td data-label="商户更新">${p.merchant_update ? `<span class="merchant-update">${escapeHTML(p.merchant_update)}</span>` : '-'}</td>
           <td data-label="采集状态">${
             p.last_fetch_ok == null
               ? '-'
               : `
                 <div class="fetch-state">
-                  <span class="fetch-badge ${p.last_fetch_ok === 1 ? 'ok' : 'fail'}">${p.last_fetch_ok === 1 ? '成功' : '失败'}</span>
+                  <span class="fetch-badge ${fetchBadgeClass}"${fetchBadgeTitle}>${fetchBadgeText}</span>
+                  ${showReasonBtn ? `<button class="btn-mini btn-reason js-fetch-reason" data-name="${escapeHTML(p.name)}" data-error="${escapeHTML(p.last_fetch_error)}">查看原因</button>` : ''}
                   <span class="muted-mini">${p.last_fetch_at ? formatDateTimeCN(p.last_fetch_at) : '-'}</span>
                 </div>
               `
@@ -276,7 +350,8 @@
             <button class="btn-mini btn-danger js-delete" data-id="${p.id}" data-name="${escapeHTML(p.name)}">删除</button>
           </td>
         </tr>
-      `).join('');
+      `;
+      }).join('');
 
       document.querySelectorAll('.js-delete').forEach((el) => {
         el.addEventListener('click', async () => {
@@ -286,6 +361,17 @@
           } catch (e) {
             showToast('删除失败: ' + e.message, 'error');
           }
+        });
+      });
+
+      document.querySelectorAll('.js-fetch-reason').forEach((el) => {
+        el.addEventListener('click', async () => {
+          await openModal({
+            title: `${el.dataset.name || '采集项'} 失败原因`,
+            message: el.dataset.error || '无详细错误信息',
+            confirmText: '我知道了',
+            hideCancel: true,
+          });
         });
       });
     }
@@ -480,16 +566,22 @@
       allProducts = data;
 
       let fxRate = null;
+      let fxDate = '';
       try {
         const fxRes = await fetch(withBase('/api/fx/hkd-cny/today'));
         if (fxRes.ok) {
           const fx = await fxRes.json();
           if (Number.isFinite(fx.rate) && fx.rate > 0) {
             fxRate = fx.rate;
+            fxDate = formatYMD(fx.date || '');
           }
         }
       } catch (e) {}
       currentFxRate = fxRate;
+      const fxText = fxRate
+        ? `今日汇率 HKD/CNY ${fxRate.toFixed(4)}${fxDate ? `（${fxDate}）` : ''}`
+        : '今日汇率 暂不可用';
+      document.getElementById('statFxRate').textContent = fxText;
       populateProductFilter(allProducts);
       populateStoreFilter(allProducts);
       applyFilters();

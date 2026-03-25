@@ -14,6 +14,7 @@ services:
       COLLECT_TIMES: "10:00,11:00,15:00"
       PUSH_TIMES: "12:00"
       SCHEDULE_TZ: "Asia/Shanghai"
+      TZ: "Asia/Shanghai"
       FLARESOLVERR_V2: "true"
       FLARESOLVERR_URL: "http://172.25.0.102:8191/v1"
       ENABLE_FLARESOLVERR_FALLBACK: "true"
