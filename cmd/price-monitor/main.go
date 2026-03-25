@@ -77,6 +77,7 @@ var flareSolverrSessionCache struct {
 	ensured time.Time
 }
 var collectRunning atomic.Bool
+var verboseLogEnabled atomic.Bool
 var weComAlertState struct {
 	mu   sync.Mutex
 	last map[string]time.Time
@@ -117,6 +118,10 @@ type httpStatusError struct {
 	Body string
 }
 
+type outOfStockError struct {
+	Detail string
+}
+
 type dailyLogWriter struct {
 	mu              sync.Mutex
 	dir             string
@@ -134,6 +139,13 @@ func (e *httpStatusError) Error() string {
 	return fmt.Sprintf("HTTP 状态码异常: %d, body=%q", e.Code, e.Body)
 }
 
+func (e *outOfStockError) Error() string {
+	if strings.TrimSpace(e.Detail) == "" {
+		return "无货"
+	}
+	return "无货: " + strings.TrimSpace(e.Detail)
+}
+
 func main() {
 	if len(os.Args) < 2 {
 		fmt.Println("用法: go run ./cmd/price-monitor [collect|ingest|serve|schedule|notify]")
@@ -143,6 +155,8 @@ func main() {
 	dbPath := envOrDefault("DB_PATH", "./data.db")
 	cfgPath := envOrDefault("PRODUCTS_CONFIG", "./config/products.json")
 	logDir := envOrDefault("LOG_DIR", "./logs")
+	verboseLogEnabled.Store(isTruthyEnv(os.Getenv("VERBOSE_LOG")))
+	log.Printf("[log] VERBOSE_LOG=%t", verboseLogEnabled.Load())
 
 	logWriter, err := setupLogging(logDir)
 	if err != nil {
@@ -157,7 +171,7 @@ func main() {
 
 	must(applySQLiteRuntimePragmas(db))
 	must(withSQLiteBusyRetry("migrate", func() error { return migrate(db) }))
-	must(withSQLiteBusyRetry("sync-products-config", func() error { return syncProductsFromConfig(db, cfgPath) }))
+	must(withSQLiteBusyRetry("sync-products-config-if-empty", func() error { return syncProductsFromConfigIfEmpty(db, cfgPath) }))
 
 	switch os.Args[1] {
 	case "collect":
@@ -327,6 +341,7 @@ func runSchedule(db *sql.DB) error {
 	timesRaw := envOrDefault("COLLECT_TIMES", "10:00,11:00,15:00")
 	pushTimesRaw := envOrDefault("PUSH_TIMES", "12:00")
 	locName := envOrDefault("SCHEDULE_TZ", "Asia/Shanghai")
+	failedRetryInterval := collectFailedRetryInterval()
 	log.Printf("[schedule] 启动参数原文: COLLECT_TIMES=%s PUSH_TIMES=%s SCHEDULE_TZ=%s", timesRaw, pushTimesRaw, locName)
 
 	loc, err := time.LoadLocation(locName)
@@ -345,6 +360,11 @@ func runSchedule(db *sql.DB) error {
 	log.Printf("[schedule] 调度启动参数: 时区=%s", locName)
 	log.Printf("[schedule] 定时采集时间表: %s", formatDailySlots(collectSlots))
 	log.Printf("[schedule] 定时推送时间表: %s", formatDailySlots(pushSlots))
+	if failedRetryInterval > 0 {
+		log.Printf("[schedule] 失败补采检查间隔: %s", failedRetryInterval.String())
+	} else {
+		log.Printf("[schedule] 失败补采检查已禁用")
+	}
 
 	if useFlareSolverrFallback() {
 		if err := preflightFlareSolverr(); err != nil {
@@ -355,6 +375,28 @@ func runSchedule(db *sql.DB) error {
 		log.Printf("[schedule] 已禁用 FlareSolverr 后备通道（ENABLE_FLARESOLVERR_FALLBACK=false）")
 	}
 	log.Printf("[schedule] 调度已启动")
+
+	if failedRetryInterval > 0 {
+		go func() {
+			for {
+				now := time.Now().In(loc)
+				next := nextIntervalBoundary(now, failedRetryInterval)
+				wait := time.Until(next)
+				if wait < 0 {
+					wait = 0
+				}
+				timer := time.NewTimer(wait)
+				<-timer.C
+				timer.Stop()
+				log.Printf("[schedule] 到达失败补采检查时间，开始检查失败商品")
+				if err := collectFailedProducts(db); err != nil {
+					log.Printf("[schedule] 失败补采执行结果: %v", err)
+				} else {
+					log.Printf("[schedule] 失败补采执行完成")
+				}
+			}
+		}()
+	}
 
 	for {
 		now := time.Now().In(loc)
@@ -375,21 +417,14 @@ func runSchedule(db *sql.DB) error {
 		if wait < 0 {
 			wait = 0
 		}
-		log.Printf("[schedule] 当前时间=%s", now.Format("2006-01-02 15:04:05 -0700 MST"))
-		log.Printf("[schedule] 下次任务=%s 时间=%s (等待=%s)", kind, next.Format("2006-01-02 15:04:05 -0700 MST"), wait.String())
+		debugLogf("[schedule] 当前时间=%s", now.Format("2006-01-02 15:04:05 -0700 MST"))
+		debugLogf("[schedule] 下次任务=%s 时间=%s (等待=%s)", kind, next.Format("2006-01-02 15:04:05 -0700 MST"), wait.String())
 
 		timer := time.NewTimer(wait)
 		<-timer.C
 		timer.Stop()
 
 		if kind == scheduleCollect {
-			if useFlareSolverrFallback() {
-				log.Printf("[schedule] 到达采集触发时间，开始预检 FlareSolverr")
-				if err := preflightFlareSolverr(); err != nil {
-					log.Printf("[schedule] 预检失败，继续执行采集（将跳过/快速失败 FlareSolverr）: %v", err)
-					maybeNotifyFlareSolverrConnectivityAlert("schedule 采集前预检", err)
-				}
-			}
 			log.Printf("[schedule] 开始执行定时采集")
 			if err := collectToday(db); err != nil {
 				log.Printf("[schedule] 定时采集失败: %v", err)
@@ -464,6 +499,55 @@ func formatDailySlots(slots []dailySlot) string {
 		parts = append(parts, fmt.Sprintf("%02d:%02d", s.Hour, s.Minute))
 	}
 	return strings.Join(parts, ",")
+}
+
+func collectFailedRetryInterval() time.Duration {
+	const defaultMinutes = 15
+	v := strings.TrimSpace(envOrDefault("COLLECT_FAILED_RETRY_MINUTES", strconv.Itoa(defaultMinutes)))
+	if v == "" {
+		return defaultMinutes * time.Minute
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return defaultMinutes * time.Minute
+	}
+	if n <= 0 {
+		return 0
+	}
+	if n > 180 {
+		n = 180
+	}
+	return time.Duration(n) * time.Minute
+}
+
+// nextIntervalBoundary 将当前时间对齐到下一个固定周期边界，避免 ticker 漂移。
+func nextIntervalBoundary(now time.Time, interval time.Duration) time.Time {
+	if interval <= 0 {
+		return now
+	}
+	step := int64(interval / time.Second)
+	if step <= 0 {
+		step = 1
+	}
+	sec := now.Unix()
+	nextSec := ((sec / step) + 1) * step
+	return time.Unix(nextSec, 0).In(now.Location())
+}
+
+func isTruthyEnv(raw string) bool {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "1", "true", "yes", "y", "on":
+		return true
+	default:
+		return false
+	}
+}
+
+func debugLogf(format string, args ...any) {
+	if !verboseLogEnabled.Load() {
+		return
+	}
+	log.Printf(format, args...)
 }
 
 func envOrDefault(key, fallback string) string {
@@ -815,10 +899,82 @@ func syncProductsFromConfig(db *sql.DB, cfgPath string) error {
 	return tx.Commit()
 }
 
+func syncProductsFromConfigIfEmpty(db *sql.DB, cfgPath string) error {
+	var cnt int
+	if err := db.QueryRow(`SELECT COUNT(1) FROM products`).Scan(&cnt); err != nil {
+		return err
+	}
+	if cnt > 0 {
+		log.Printf("[sync-products-config] products 表已有数据（count=%d），跳过从配置文件导入", cnt)
+		return nil
+	}
+	log.Printf("[sync-products-config] products 表为空，开始从配置文件导入: %s", cfgPath)
+	return syncProductsFromConfig(db, cfgPath)
+}
+
 type collectFailureDetail struct {
 	ProductName string
 	StoreName   string
 	Err         string
+}
+
+type pendingCollectFailure struct {
+	product  Product
+	firstErr error
+}
+
+// collectRunState 聚合一轮采集的统计与失败样本，避免在主流程中散落大量计数和写库细节。
+type collectRunState struct {
+	runLabel        string
+	successCount    int
+	outOfStockCount int
+	failCount       int
+	blockedByWAF    bool
+	failures        []collectFailureDetail
+}
+
+func newCollectRunState(runLabel string) *collectRunState {
+	return &collectRunState{
+		runLabel: runLabel,
+		failures: make([]collectFailureDetail, 0, 8),
+	}
+}
+
+func (s *collectRunState) markOutOfStock(db *sql.DB, p Product, err error) {
+	debugLogf("[collect][%s][%s] 店铺报价不可用，标记无货: %v", s.runLabel, p.Name, err)
+	s.outOfStockCount++
+	_ = insertFetchLog(db, p.ID, false, err.Error())
+	_ = updateLastFetchStatus(db, p.ID, false, err.Error())
+}
+
+func (s *collectRunState) markFailure(db *sql.DB, p Product, errText string) {
+	errText = strings.TrimSpace(errText)
+	s.failCount++
+	s.failures = append(s.failures, collectFailureDetail{
+		ProductName: p.Name,
+		StoreName:   p.StoreName,
+		Err:         errText,
+	})
+	_ = insertFetchLog(db, p.ID, false, errText)
+	_ = updateLastFetchStatus(db, p.ID, false, errText)
+}
+
+func (s *collectRunState) markSuccess(db *sql.DB, p Product, got FetchResult, phase string) {
+	if phase == "补抓" {
+		debugLogf("[collect][%s][%s][%s] 单店失败补抓成功: price=%.2f raw=%s merchant_update=%s", s.runLabel, p.Name, p.StoreName, got.Price, got.RawPrice, got.MerchantUpdate)
+	} else {
+		debugLogf("[collect][%s][%s][%s] 采集成功: price=%.2f raw=%s merchant_update=%s", s.runLabel, p.Name, p.StoreName, got.Price, got.RawPrice, got.MerchantUpdate)
+	}
+	_ = insertFetchLog(db, p.ID, true, "")
+	_ = updateLastFetchStatus(db, p.ID, true, "")
+	s.successCount++
+}
+
+func (s *collectRunState) inspectFetchErr(err error) {
+	lowered := strings.ToLower(err.Error())
+	if strings.Contains(lowered, "just a moment") || strings.Contains(lowered, "cloudflare") {
+		s.blockedByWAF = true
+	}
 }
 
 func collectToday(db *sql.DB) error {
@@ -827,93 +983,248 @@ func collectToday(db *sql.DB) error {
 	}
 	defer collectRunning.Store(false)
 
+	if shouldCheckFlareSolverrBeforeCollect() {
+		log.Printf("[collect] 采集前检查 FlareSolverr 连通性: %s", flareSolverrURL())
+		if err := ensureFlareSolverrReachableWithRetry(); err != nil {
+			log.Printf("[collect] 采集前检查失败，已跳过本轮采集: %v", err)
+			maybeNotifyFlareSolverrConnectivityAlert("collect 采集前检查", err)
+			return fmt.Errorf("采集前检查 0.102 服务不通，已跳过采集: %w", err)
+		}
+	}
+
 	products, err := getActiveProducts(db)
 	if err != nil {
 		return err
 	}
+	return runCollectForProducts(db, products, "collect")
+}
+
+func collectFailedProducts(db *sql.DB) error {
+	if !collectRunning.CompareAndSwap(false, true) {
+		log.Printf("[retry-collect] 已有采集任务在执行，跳过本次失败补采")
+		return nil
+	}
+	defer collectRunning.Store(false)
+
+	products, err := getFailedProductsForRetry(db)
+	if err != nil {
+		return err
+	}
+	if len(products) == 0 {
+		log.Printf("[retry-collect] 当前无失败商品，跳过补采")
+		return nil
+	}
+	log.Printf("[retry-collect] 检测到失败商品数量=%d，开始补采", len(products))
+	return runCollectForProducts(db, products, "retry")
+}
+
+// runCollectForProducts 统一处理常规采集与失败补采，保证两条路径逻辑一致。
+func runCollectForProducts(db *sql.DB, products []Product, runLabel string) error {
 	if len(products) == 0 {
 		return fmt.Errorf("没有可采集的 active 商品")
 	}
 
 	today := chinaNow().Format("2006-01-02")
-	log.Printf("[collect] 本轮采集开始，日期=%s，商品数量=%d", today, len(products))
-	blockedByWAF := false
-	flareConnIssue := false
-	successCount := 0
-	failCount := 0
-	failures := make([]collectFailureDetail, 0, 8)
-	for i, p := range products {
+	log.Printf("[collect][%s] 本轮采集开始，日期=%s，商品数量=%d", runLabel, today, len(products))
+	urlGroups := groupProductsByURL(products)
+	log.Printf("[collect][%s] 本轮按URL分组后需访问页面数=%d", runLabel, len(urlGroups))
+	state := newCollectRunState(runLabel)
+	for i, g := range urlGroups {
 		if i > 0 {
 			delay := collectItemDelay()
 			if delay > 0 {
-				log.Printf("[collect] 商品间隔等待: %s", delay.String())
+				debugLogf("[collect][%s] 商品间隔等待: %s", runLabel, delay.String())
 				time.Sleep(delay)
 			}
 		}
-		log.Printf("[collect][%d/%d][%s] 开始采集，店铺=%s，URL=%s", i+1, len(products), p.Name, p.StoreName, p.URL)
-		got, err := fetchPrice(p)
+		sample := g.Items[0]
+		debugLogf("[collect][%s][%d/%d][url=%s] 开始采集，分组商品数=%d", runLabel, i+1, len(urlGroups), g.URL, len(g.Items))
+		content, err := fetchProductPageContent(sample)
 		if err != nil {
-			log.Printf("[collect][%s] 采集失败: %v", p.Name, err)
-			failCount++
-			failures = append(failures, collectFailureDetail{
-				ProductName: p.Name,
-				StoreName:   p.StoreName,
-				Err:         err.Error(),
-			})
-			_ = insertFetchLog(db, p.ID, false, err.Error())
-			_ = updateLastFetchStatus(db, p.ID, false, err.Error())
-			if strings.Contains(strings.ToLower(err.Error()), "just a moment") ||
-				strings.Contains(strings.ToLower(err.Error()), "cloudflare") {
-				blockedByWAF = true
+			log.Printf("[collect][%s][url=%s] 页面抓取失败: %v", runLabel, g.URL, err)
+			for _, p := range g.Items {
+				if isOutOfStockError(err) {
+					state.markOutOfStock(db, p, err)
+					continue
+				}
+				state.markFailure(db, p, err.Error())
 			}
-			if isFlareSolverrTargetHost(flareSolverrURL(), "172.25.0.102") && isFlareSolverrConnectivityError(err) {
-				flareConnIssue = true
-			}
+			state.inspectFetchErr(err)
 			continue
 		}
 
-		log.Printf("[collect][%s] 抓取完成，准备写入数据库", p.Name)
-		err = upsertDailyPrice(db, p.ID, today, p.StoreName, got.Price, got.RawPrice, got.MerchantUpdate, p.URL)
-		if err != nil {
-			log.Printf("[collect][%s] 写入失败: %v", p.Name, err)
-			failCount++
-			failures = append(failures, collectFailureDetail{
-				ProductName: p.Name,
-				StoreName:   p.StoreName,
-				Err:         err.Error(),
-			})
-			_ = insertFetchLog(db, p.ID, false, err.Error())
-			_ = updateLastFetchStatus(db, p.ID, false, err.Error())
-			continue
+		groupSuccess := 0
+		pendingFailures := make([]pendingCollectFailure, 0, 2)
+		for _, p := range g.Items {
+			got, perr := parseFetchResultFromContent(content, p)
+			if perr != nil {
+				if isOutOfStockError(perr) {
+					state.markOutOfStock(db, p, perr)
+					continue
+				}
+				log.Printf("[collect][%s][%s] 页面已抓取但解析失败: %v", runLabel, p.Name, perr)
+				pendingFailures = append(pendingFailures, pendingCollectFailure{
+					product:  p,
+					firstErr: perr,
+				})
+				continue
+			}
+			debugLogf("[collect][%s][%s] 抓取完成，准备写入数据库", runLabel, p.Name)
+			err = upsertDailyPrice(db, p.ID, today, p.StoreName, got.Price, got.RawPrice, got.MerchantUpdate, p.URL)
+			if err != nil {
+				log.Printf("[collect][%s][%s] 写入失败: %v", runLabel, p.Name, err)
+				state.markFailure(db, p, err.Error())
+				continue
+			}
+			debugLogf("[collect][%s][%s] 写入成功，记录抓取日志与状态", runLabel, p.Name)
+			state.markSuccess(db, p, got, "首抓")
+			groupSuccess++
 		}
-		log.Printf("[collect][%s] 写入成功，记录抓取日志与状态", p.Name)
-		_ = insertFetchLog(db, p.ID, true, "")
-		_ = updateLastFetchStatus(db, p.ID, true, "")
-		successCount++
-		log.Printf("[collect][%s][%s] 采集成功: price=%.2f raw=%s merchant_update=%s", p.Name, p.StoreName, got.Price, got.RawPrice, got.MerchantUpdate)
-	}
-	log.Printf("[collect] 本轮采集结束: success=%d failed=%d", successCount, failCount)
-	if failCount > 0 {
-		if err := sendCollectFailureAlertToWeCom(today, successCount, failCount, failures, blockedByWAF, flareConnIssue); err != nil {
-			log.Printf("[alert] 采集失败告警发送失败: %v", err)
-		} else {
-			log.Printf("[alert] 采集失败告警已发送")
+
+		// 同一URL下若出现“部分店铺成功 + 部分店铺失败”，对失败店铺做一次延迟补抓。
+		if len(pendingFailures) > 0 && groupSuccess > 0 {
+			retryDelay := collectPartialRetryDelay()
+			log.Printf("[collect][%s][url=%s] 检测到单店失败，%s 后补抓失败店铺，数量=%d", runLabel, g.URL, retryDelay.String(), len(pendingFailures))
+			time.Sleep(retryDelay)
+
+			retryContent, retryErr := fetchProductPageContent(sample)
+			if retryErr != nil {
+				log.Printf("[collect][%s][url=%s] 单店失败补抓页面失败: %v", runLabel, g.URL, retryErr)
+				for _, pf := range pendingFailures {
+					finalErr := fmt.Sprintf("首次解析失败: %v; 补抓失败: %v", pf.firstErr, retryErr)
+					state.markFailure(db, pf.product, finalErr)
+				}
+			} else {
+				for _, pf := range pendingFailures {
+					got, perr := parseFetchResultFromContent(retryContent, pf.product)
+					if perr != nil {
+						finalErr := fmt.Sprintf("首次解析失败: %v; 补抓解析失败: %v", pf.firstErr, perr)
+						if isOutOfStockError(perr) {
+							debugLogf("[collect][%s][%s] 补抓后判定无货: %v", runLabel, pf.product.Name, perr)
+							state.markOutOfStock(db, pf.product, perr)
+							continue
+						}
+						state.markFailure(db, pf.product, finalErr)
+						continue
+					}
+					if werr := upsertDailyPrice(db, pf.product.ID, today, pf.product.StoreName, got.Price, got.RawPrice, got.MerchantUpdate, pf.product.URL); werr != nil {
+						finalErr := fmt.Sprintf("首次解析失败: %v; 补抓写入失败: %v", pf.firstErr, werr)
+						state.markFailure(db, pf.product, finalErr)
+						continue
+					}
+					state.markSuccess(db, pf.product, got, "补抓")
+				}
+			}
+		} else if len(pendingFailures) > 0 {
+			for _, pf := range pendingFailures {
+				state.markFailure(db, pf.product, pf.firstErr.Error())
+			}
 		}
 	}
-	if successCount == 0 && blockedByWAF {
+	log.Printf("[collect][%s] 本轮采集结束: success=%d out_of_stock=%d failed=%d", runLabel, state.successCount, state.outOfStockCount, state.failCount)
+	if state.successCount == 0 && state.blockedByWAF {
 		return fmt.Errorf("当前被 Cloudflare 挑战拦截（Just a moment），请启用 FlareSolverr 或手动验证会话")
 	}
-	if successCount == 0 {
+	if state.successCount == 0 && state.failCount > 0 {
 		return fmt.Errorf("本轮采集无成功记录")
 	}
 	return nil
 }
 
-type manualPriceInput struct {
-	URL            string  `json:"url"`
-	StoreName      string  `json:"store_name"`
-	Price          float64 `json:"price"`
-	MerchantUpdate string  `json:"merchant_update"`
+func collectPartialRetryDelay() time.Duration {
+	const defaultSeconds = 3
+	v := strings.TrimSpace(envOrDefault("COLLECT_PARTIAL_RETRY_DELAY_SECONDS", strconv.Itoa(defaultSeconds)))
+	if v == "" {
+		return defaultSeconds * time.Second
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return defaultSeconds * time.Second
+	}
+	if n < 1 {
+		n = 1
+	}
+	if n > 60 {
+		n = 60
+	}
+	return time.Duration(n) * time.Second
+}
+
+type urlProductGroup struct {
+	URL   string
+	Items []Product
+}
+
+func groupProductsByURL(products []Product) []urlProductGroup {
+	out := make([]urlProductGroup, 0, len(products))
+	idxByURL := make(map[string]int, len(products))
+	for _, p := range products {
+		key := normalizeFetchURL(p.URL)
+		if key == "" {
+			key = strings.TrimSpace(p.URL)
+		}
+		if idx, ok := idxByURL[key]; ok {
+			out[idx].Items = append(out[idx].Items, p)
+			continue
+		}
+		idxByURL[key] = len(out)
+		out = append(out, urlProductGroup{
+			URL:   key,
+			Items: []Product{p},
+		})
+	}
+	return out
+}
+
+func shouldCheckFlareSolverrBeforeCollect() bool {
+	if !useFlareSolverrFallback() {
+		return false
+	}
+	return isFlareSolverrTargetHost(flareSolverrURL(), "172.25.0.102")
+}
+
+func ensureFlareSolverrReachableWithRetry() error {
+	const defaultRetryCount = 5
+	const defaultRetryInterval = 30 * time.Minute
+
+	retryCount := defaultRetryCount
+	if v := strings.TrimSpace(envOrDefault("COLLECT_PREFLIGHT_RETRY_COUNT", strconv.Itoa(defaultRetryCount))); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 && n <= 24 {
+			retryCount = n
+		}
+	}
+
+	retryInterval := defaultRetryInterval
+	if v := strings.TrimSpace(envOrDefault("COLLECT_PREFLIGHT_RETRY_INTERVAL_MINUTES", "30")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 1 && n <= 720 {
+			retryInterval = time.Duration(n) * time.Minute
+		}
+	}
+
+	err := preflightFlareSolverr()
+	if err == nil {
+		return nil
+	}
+	if !isFlareSolverrConnectivityError(err) {
+		log.Printf("[collect] 0.102 预检未通过，但不属于网络断连，继续采集: %v", err)
+		return nil
+	}
+	firstErr := err
+	for i := 1; i <= retryCount; i++ {
+		log.Printf("[collect] 0.102 连通性检查失败，等待后重试: %d/%d interval=%s err=%v", i, retryCount, retryInterval.String(), err)
+		time.Sleep(retryInterval)
+		err = preflightFlareSolverr()
+		if err == nil {
+			log.Printf("[collect] 0.102 连通性恢复，继续采集")
+			return nil
+		}
+		if !isFlareSolverrConnectivityError(err) {
+			log.Printf("[collect] 0.102 重试后可连通，继续采集（当前为非网络错误）: %v", err)
+			return nil
+		}
+	}
+	maybeNotifyFlareSolverrConnectivityAlert(fmt.Sprintf("collect 采集前检查重试已达上限 %d 次", retryCount), err)
+	return fmt.Errorf("0.102 连通性检查失败（首次错误: %v）", firstErr)
 }
 
 func getActiveProducts(db *sql.DB) ([]Product, error) {
@@ -936,23 +1247,57 @@ func getActiveProducts(db *sql.DB) ([]Product, error) {
 	return out, rows.Err()
 }
 
+func getFailedProductsForRetry(db *sql.DB) ([]Product, error) {
+	rows, err := db.Query(`SELECT id, name, store_name, url, price_regex, update_regex, currency, active
+		FROM products
+		WHERE active = 1
+		  AND COALESCE(last_fetch_ok, 1) = 0
+		  AND LOWER(COALESCE(last_fetch_error, '')) NOT LIKE '无货%'
+		  AND LOWER(COALESCE(last_fetch_error, '')) NOT LIKE '無貨%'
+		ORDER BY id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []Product
+	for rows.Next() {
+		var p Product
+		var active int
+		if err := rows.Scan(&p.ID, &p.Name, &p.StoreName, &p.URL, &p.PriceRegex, &p.UpdateRegex, &p.Currency, &active); err != nil {
+			return nil, err
+		}
+		p.Active = active == 1
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
 func fetchPrice(p Product) (FetchResult, error) {
-	log.Printf("[fetch][%s] 开始抓取链路", p.Name)
+	content, err := fetchProductPageContent(p)
+	if err != nil {
+		return FetchResult{}, err
+	}
+	return parseFetchResultFromContent(content, p)
+}
+
+func fetchProductPageContent(p Product) (string, error) {
+	debugLogf("[fetch][%s] 开始抓取链路", p.Name)
 	var fsErr error
 	if useFlareSolverrFallback() && shouldUseFlareSolverrNow() {
-		log.Printf("[fetch][%s] 步骤1: 尝试 FlareSolverr", p.Name)
-		got, err := fetchPriceViaFlareSolverr(p)
+		debugLogf("[fetch][%s] 步骤1: 尝试 FlareSolverr", p.Name)
+		content, err := fetchPriceViaFlareSolverr(p)
 		if err == nil {
-			log.Printf("[fetch][%s] FlareSolverr 抓取成功", p.Name)
-			return got, nil
+			debugLogf("[fetch][%s] FlareSolverr 抓取成功", p.Name)
+			return content, nil
 		}
 		fsErr = err
 		log.Printf("[fetch][%s] FlareSolverr 失败，回退 HTTP: %v", p.Name, err)
 	} else if useFlareSolverrFallback() {
-		log.Printf("[fetch][%s] 步骤1: 跳过 FlareSolverr（熔断窗口中）", p.Name)
+		debugLogf("[fetch][%s] 步骤1: 跳过 FlareSolverr（熔断窗口中）", p.Name)
 	}
 
-	log.Printf("[fetch][%s] 步骤2: 尝试 HTTP 抓取", p.Name)
+	debugLogf("[fetch][%s] 步骤2: 尝试 HTTP 抓取", p.Name)
 	client := newBrowserLikeClient()
 	uaList := []string{
 		"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
@@ -962,14 +1307,14 @@ func fetchPrice(p Product) (FetchResult, error) {
 
 	var lastErr error
 	for i, ua := range uaList {
-		log.Printf("[fetch][%s] HTTP 尝试 #%d, UA=%s", p.Name, i+1, ua)
-		got, err := fetchPriceOnce(client, p, ua)
+		debugLogf("[fetch][%s] HTTP 尝试 #%d", p.Name, i+1)
+		content, err := fetchPriceOnce(client, p, ua)
 		if err == nil {
-			log.Printf("[fetch][%s] HTTP 抓取成功 (尝试 #%d)", p.Name, i+1)
-			return got, nil
+			debugLogf("[fetch][%s] HTTP 抓取成功 (尝试 #%d)", p.Name, i+1)
+			return content, nil
 		}
 		lastErr = err
-		log.Printf("[fetch][%s] HTTP 失败 (尝试 #%d): %v", p.Name, i+1, err)
+		debugLogf("[fetch][%s] HTTP 失败 (尝试 #%d): %v", p.Name, i+1, err)
 
 		var hs *httpStatusError
 		if errors.As(err, &hs) && hs.Code == http.StatusForbidden {
@@ -982,7 +1327,49 @@ func fetchPrice(p Product) (FetchResult, error) {
 		}
 		break
 	}
-	return FetchResult{}, fmt.Errorf("抓取失败: flaresolverrErr=%v httpErr=%w", fsErr, lastErr)
+
+	// 典型故障链路：FlareSolverr 短暂抖动(EOF/超时) + HTTP 403 挑战。
+	// 这里做一次“强制重建会话后再试 FlareSolverr”，避免瞬时故障导致整轮失败。
+	var hs *httpStatusError
+	if fsErr != nil && errors.As(lastErr, &hs) && hs.Code == http.StatusForbidden && isFlareSolverrConnectivityError(fsErr) {
+		debugLogf("[fetch][%s] 检测到 FlareSolverr 抖动 + HTTP 403，执行强制重建会话后重试", p.Name)
+		fsURL := flareSolverrURL()
+		sessionName := flareSolverrSessionName()
+		invalidateFlareSolverrSessionCache(fsURL, sessionName)
+		_ = destroyFlareSolverrSession(fsURL, sessionName)
+		time.Sleep(2 * time.Second)
+		content, retryErr := fetchPriceViaFlareSolverr(p)
+		if retryErr == nil {
+			debugLogf("[fetch][%s] 强制重试 FlareSolverr 成功", p.Name)
+			return content, nil
+		}
+		debugLogf("[fetch][%s] 强制重试 FlareSolverr 失败: %v", p.Name, retryErr)
+		fsErr = fmt.Errorf("%v; forced_retry=%v", fsErr, retryErr)
+	}
+	return "", fmt.Errorf("抓取失败: flaresolverrErr=%v httpErr=%w", fsErr, lastErr)
+}
+
+func parseFetchResultFromContent(content string, p Product) (FetchResult, error) {
+	raw, err := extractByRegex(content, p.PriceRegex)
+	if err != nil {
+		if hint := detectOutOfStockHint(content); hint != "" {
+			return FetchResult{}, &outOfStockError{Detail: hint}
+		}
+		return FetchResult{}, err
+	}
+	price, err := parsePrice(raw)
+	if err != nil {
+		return FetchResult{}, fmt.Errorf("解析价格失败: %w", err)
+	}
+	merchantUpdate := extractMerchantUpdate(content, p)
+	if merchantUpdate == "" {
+		merchantUpdate = chinaNow().Format("2006-01-02")
+	}
+	return FetchResult{
+		Price:          price,
+		RawPrice:       raw,
+		MerchantUpdate: merchantUpdate,
+	}, nil
 }
 
 func useFlareSolverrFallback() bool {
@@ -1018,16 +1405,68 @@ func flareSolverrURL() string {
 
 func preflightFlareSolverr() error {
 	fsURL := flareSolverrURL()
-	log.Printf("[flaresolverr] 预检开始: %s", fsURL)
-	_, err := callFlareSolverr(fsURL, map[string]any{"cmd": "sessions.list"}, 10*time.Second)
-	if err != nil {
-		return fmt.Errorf("FlareSolverr 预检失败: %w", err)
+	timeout := flareSolverrPreflightTimeout()
+	attempts := flareSolverrPreflightAttempts()
+	interval := flareSolverrPreflightRetryInterval()
+	var lastErr error
+
+	for i := 1; i <= attempts; i++ {
+		log.Printf("[flaresolverr] 预检开始: %s (attempt=%d/%d timeout=%s)", fsURL, i, attempts, timeout.String())
+		_, err := callFlareSolverr(fsURL, map[string]any{"cmd": "sessions.list"}, timeout)
+		if err == nil {
+			if _, serr := ensureFlareSolverrSession(fsURL, flareSolverrSessionName()); serr != nil {
+				if isFlareSolverrConnectivityError(serr) {
+					lastErr = serr
+				} else {
+					log.Printf("[flaresolverr] 预检通过（会话检查失败但可连通）: %v", serr)
+					return nil
+				}
+			} else {
+				log.Printf("[flaresolverr] 预检通过，会话=%s", flareSolverrSessionName())
+				return nil
+			}
+		} else {
+			lastErr = err
+			if !isFlareSolverrConnectivityError(err) {
+				log.Printf("[flaresolverr] 预检返回非网络错误，视为可连通: %v", err)
+				return nil
+			}
+		}
+		if i < attempts {
+			time.Sleep(interval)
+		}
 	}
-	_, err = ensureFlareSolverrSession(fsURL, flareSolverrSessionName())
-	if err == nil {
-		log.Printf("[flaresolverr] 预检通过，会话=%s", flareSolverrSessionName())
+	return fmt.Errorf("FlareSolverr 预检失败: %w", lastErr)
+}
+
+func flareSolverrPreflightTimeout() time.Duration {
+	sec := 30
+	if v := strings.TrimSpace(envOrDefault("FLARESOLVERR_PREFLIGHT_TIMEOUT_SECONDS", "30")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 5 && n <= 180 {
+			sec = n
+		}
 	}
-	return err
+	return time.Duration(sec) * time.Second
+}
+
+func flareSolverrPreflightAttempts() int {
+	attempts := 3
+	if v := strings.TrimSpace(envOrDefault("FLARESOLVERR_PREFLIGHT_ATTEMPTS", "3")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 1 && n <= 10 {
+			attempts = n
+		}
+	}
+	return attempts
+}
+
+func flareSolverrPreflightRetryInterval() time.Duration {
+	sec := 5
+	if v := strings.TrimSpace(envOrDefault("FLARESOLVERR_PREFLIGHT_RETRY_INTERVAL_SECONDS", "5")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 1 && n <= 60 {
+			sec = n
+		}
+	}
+	return time.Duration(sec) * time.Second
 }
 
 func maybeNotifyFlareSolverrConnectivityAlert(scene string, err error) {
@@ -1065,8 +1504,16 @@ func isFlareSolverrConnectivityError(err error) bool {
 		return false
 	}
 	s := strings.ToLower(err.Error())
-	if strings.Contains(s, "flaresolverr 不可用(") {
-		return true
+	nonConnectivitySigns := []string{
+		"http 状态异常",
+		"响应解析失败",
+		"flaresolverr 失败: status=",
+		"flaresolverr 失败: ",
+	}
+	for _, sign := range nonConnectivitySigns {
+		if strings.Contains(s, sign) {
+			return false
+		}
 	}
 	signatures := []string{
 		"dial tcp",
@@ -1077,8 +1524,7 @@ func isFlareSolverrConnectivityError(err error) bool {
 		"no such host",
 		"no route to host",
 		"network is unreachable",
-		"connection reset by peer",
-		"eof",
+		"host is down",
 	}
 	for _, sign := range signatures {
 		if strings.Contains(s, sign) {
@@ -1120,13 +1566,13 @@ func newBrowserLikeClient() *http.Client {
 	}
 }
 
-func fetchPriceOnce(client *http.Client, p Product, ua string) (FetchResult, error) {
-	log.Printf("[http][%s] 预热首页", p.Name)
+func fetchPriceOnce(client *http.Client, p Product, ua string) (string, error) {
+	debugLogf("[http][%s] 预热首页", p.Name)
 	_ = warmUpHome(client, p.URL, ua)
-	log.Printf("[http][%s] 请求商品页", p.Name)
+	debugLogf("[http][%s] 请求商品页", p.Name)
 	req, err := http.NewRequest(http.MethodGet, p.URL, nil)
 	if err != nil {
-		return FetchResult{}, err
+		return "", err
 	}
 	req.Header.Set("User-Agent", ua)
 	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
@@ -1145,39 +1591,23 @@ func fetchPriceOnce(client *http.Client, p Product, ua string) (FetchResult, err
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return FetchResult{}, err
+		return "", err
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 2*1024*1024))
 	if err != nil {
-		return FetchResult{}, err
+		return "", err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		snip := strings.TrimSpace(string(body))
 		if len(snip) > 200 {
 			snip = snip[:200]
 		}
-		return FetchResult{}, &httpStatusError{Code: resp.StatusCode, Body: snip}
+		return "", &httpStatusError{Code: resp.StatusCode, Body: snip}
 	}
 	content := string(body)
-	log.Printf("[http][%s] 页面响应成功，开始解析价格字段", p.Name)
-
-	raw, err := extractByRegex(content, p.PriceRegex)
-	if err != nil {
-		log.Printf("[http][%s] 价格正则未匹配", p.Name)
-		return FetchResult{}, err
-	}
-	price, err := parsePrice(raw)
-	if err != nil {
-		return FetchResult{}, fmt.Errorf("解析价格失败: %w", err)
-	}
-	log.Printf("[http][%s] 价格解析成功: raw=%s price=%.2f", p.Name, raw, price)
-	merchantUpdate := extractMerchantUpdate(content, p)
-	if merchantUpdate == "" {
-		merchantUpdate = chinaNow().Format("2006-01-02")
-	}
-	log.Printf("[http][%s] 商户更新字段=%s", p.Name, merchantUpdate)
-	return FetchResult{Price: price, RawPrice: raw, MerchantUpdate: merchantUpdate}, nil
+	debugLogf("[http][%s] 页面响应成功", p.Name)
+	return content, nil
 }
 
 func warmUpHome(client *http.Client, pageURL, ua string) error {
@@ -1225,12 +1655,12 @@ func looksLikeCloudflareChallenge(html string) bool {
 		strings.Contains(s, "just a moment")
 }
 
-func fetchPriceViaFlareSolverr(p Product) (FetchResult, error) {
+func fetchPriceViaFlareSolverr(p Product) (string, error) {
 	fsURL := flareSolverrURL()
 	sessionName := flareSolverrSessionName()
-	log.Printf("[flaresolverr][%s] 开始抓取，url=%s session=%s", p.Name, fsURL, sessionName)
+	debugLogf("[flaresolverr][%s] 开始抓取，url=%s session=%s", p.Name, fsURL, sessionName)
 	if _, err := ensureFlareSolverrSessionCached(fsURL, sessionName); err != nil {
-		return FetchResult{}, err
+		return "", err
 	}
 
 	var out flareSolverrResp
@@ -1239,14 +1669,14 @@ func fetchPriceViaFlareSolverr(p Product) (FetchResult, error) {
 	maxTimeoutMS := flareSolverrMaxTimeoutMS()
 	retries := flareSolverrMaxRetries()
 	for i := 0; i < retries; i++ {
-		log.Printf("[flaresolverr][%s] 请求尝试 #%d", p.Name, i+1)
+		debugLogf("[flaresolverr][%s] 请求尝试 #%d", p.Name, i+1)
 		if i > 0 || shouldWarmupFlareSolverr() {
 			_ = warmupFlareSolverrHome(fsURL, sessionName, maxTimeoutMS, httpTimeout)
 		}
 		payload := newFlareSolverrRequestGetPayload(p.URL, sessionName, maxTimeoutMS)
 		resp, err := callFlareSolverr(fsURL, payload, httpTimeout)
 		if err != nil {
-			log.Printf("[flaresolverr][%s] 尝试 #%d 失败: %v", p.Name, i+1, err)
+			debugLogf("[flaresolverr][%s] 尝试 #%d 失败: %v", p.Name, i+1, err)
 			lastErr = err
 			markFlareSolverrFailure(err)
 			if shouldRecycleFlareSolverrSession() {
@@ -1261,7 +1691,7 @@ func fetchPriceViaFlareSolverr(p Product) (FetchResult, error) {
 		}
 		out = resp
 		if looksLikeCloudflareChallenge(out.Solution.Response) {
-			log.Printf("[flaresolverr][%s] 尝试 #%d 返回挑战页，重建会话", p.Name, i+1)
+			debugLogf("[flaresolverr][%s] 尝试 #%d 返回挑战页，重建会话", p.Name, i+1)
 			lastErr = fmt.Errorf("FlareSolverr 返回挑战页")
 			markFlareSolverrFailure(lastErr)
 			if shouldRecycleFlareSolverrSession() {
@@ -1276,28 +1706,13 @@ func fetchPriceViaFlareSolverr(p Product) (FetchResult, error) {
 		}
 		lastErr = nil
 		markFlareSolverrSuccess()
-		log.Printf("[flaresolverr][%s] 尝试 #%d 成功", p.Name, i+1)
+		debugLogf("[flaresolverr][%s] 尝试 #%d 成功", p.Name, i+1)
 		break
 	}
 	if lastErr != nil {
-		return FetchResult{}, fmt.Errorf("FlareSolverr 重试后仍失败: %w", lastErr)
+		return "", fmt.Errorf("FlareSolverr 重试后仍失败: %w", lastErr)
 	}
-
-	raw, err := extractByRegex(out.Solution.Response, p.PriceRegex)
-	if err != nil {
-		return FetchResult{}, err
-	}
-	log.Printf("[flaresolverr][%s] 价格匹配成功: raw=%s", p.Name, raw)
-	price, err := parsePrice(raw)
-	if err != nil {
-		return FetchResult{}, fmt.Errorf("FlareSolverr 后备通道解析价格失败: %w", err)
-	}
-	merchantUpdate := extractMerchantUpdate(out.Solution.Response, p)
-	if merchantUpdate == "" {
-		merchantUpdate = chinaNow().Format("2006-01-02")
-	}
-	log.Printf("[flaresolverr][%s] 商户更新字段=%s", p.Name, merchantUpdate)
-	return FetchResult{Price: price, RawPrice: raw, MerchantUpdate: merchantUpdate}, nil
+	return out.Solution.Response, nil
 }
 
 func shouldWarmupFlareSolverr() bool {
@@ -1452,41 +1867,96 @@ func callFlareSolverr(fsURL string, payload map[string]any, timeout time.Duratio
 	if v, ok := payload["cmd"].(string); ok {
 		cmd = v
 	}
-	log.Printf("[flaresolverr] 调用接口: cmd=%s timeout=%s", cmd, timeout.String())
+	debugLogf("[flaresolverr] 调用接口: cmd=%s timeout=%s", cmd, timeout.String())
 	b, _ := json.Marshal(payload)
-	req, err := http.NewRequest(http.MethodPost, fsURL, bytes.NewReader(b))
-	if err != nil {
-		return flareSolverrResp{}, err
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := (&http.Client{Timeout: timeout}).Do(req)
-	if err != nil {
-		return flareSolverrResp{}, fmt.Errorf("FlareSolverr 不可用(%s): %w", fsURL, err)
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 8*1024*1024))
-	if err != nil {
-		return flareSolverrResp{}, err
-	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		log.Printf("[flaresolverr] 调用失败: cmd=%s status=%d", cmd, resp.StatusCode)
-		return flareSolverrResp{}, fmt.Errorf("FlareSolverr HTTP 状态异常: %d", resp.StatusCode)
-	}
-
-	var out flareSolverrResp
-	if err := json.Unmarshal(body, &out); err != nil {
-		return flareSolverrResp{}, fmt.Errorf("FlareSolverr 响应解析失败: %w", err)
-	}
-	if strings.ToLower(out.Status) != "ok" {
-		if out.Message != "" {
-			return flareSolverrResp{}, fmt.Errorf("FlareSolverr 失败: %s", out.Message)
+	apiRetries := flareSolverrAPIRetries()
+	var lastErr error
+	for i := 0; i <= apiRetries; i++ {
+		req, err := http.NewRequest(http.MethodPost, fsURL, bytes.NewReader(b))
+		if err != nil {
+			return flareSolverrResp{}, err
 		}
-		return flareSolverrResp{}, fmt.Errorf("FlareSolverr 失败: status=%s", out.Status)
+		req.Header.Set("Content-Type", "application/json")
+
+		client := &http.Client{
+			Timeout: timeout,
+			Transport: &http.Transport{
+				DisableKeepAlives: true,
+			},
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			lastErr = fmt.Errorf("FlareSolverr 不可用(%s): %w", fsURL, err)
+			if i < apiRetries && shouldRetryFlareSolverrTransportError(lastErr) {
+				wait := time.Duration(i+1) * 900 * time.Millisecond
+				debugLogf("[flaresolverr] 接口调用重试: cmd=%s attempt=%d/%d wait=%s err=%v", cmd, i+1, apiRetries+1, wait.String(), err)
+				time.Sleep(wait)
+				continue
+			}
+			return flareSolverrResp{}, lastErr
+		}
+
+		body, rerr := io.ReadAll(io.LimitReader(resp.Body, 8*1024*1024))
+		resp.Body.Close()
+		if rerr != nil {
+			lastErr = rerr
+			if i < apiRetries {
+				wait := time.Duration(i+1) * 900 * time.Millisecond
+				debugLogf("[flaresolverr] 接口读取失败重试: cmd=%s attempt=%d/%d wait=%s err=%v", cmd, i+1, apiRetries+1, wait.String(), rerr)
+				time.Sleep(wait)
+				continue
+			}
+			return flareSolverrResp{}, rerr
+		}
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			log.Printf("[flaresolverr] 调用失败: cmd=%s status=%d", cmd, resp.StatusCode)
+			return flareSolverrResp{}, fmt.Errorf("FlareSolverr HTTP 状态异常: %d", resp.StatusCode)
+		}
+
+		var out flareSolverrResp
+		if err := json.Unmarshal(body, &out); err != nil {
+			return flareSolverrResp{}, fmt.Errorf("FlareSolverr 响应解析失败: %w", err)
+		}
+		if strings.ToLower(out.Status) != "ok" {
+			if out.Message != "" {
+				return flareSolverrResp{}, fmt.Errorf("FlareSolverr 失败: %s", out.Message)
+			}
+			return flareSolverrResp{}, fmt.Errorf("FlareSolverr 失败: status=%s", out.Status)
+		}
+		debugLogf("[flaresolverr] 调用成功: cmd=%s", cmd)
+		return out, nil
 	}
-	log.Printf("[flaresolverr] 调用成功: cmd=%s", cmd)
-	return out, nil
+	return flareSolverrResp{}, lastErr
+}
+
+func flareSolverrAPIRetries() int {
+	n := 2
+	if v := strings.TrimSpace(envOrDefault("FLARESOLVERR_API_RETRIES", "2")); v != "" {
+		if i, err := strconv.Atoi(v); err == nil && i >= 0 && i <= 5 {
+			n = i
+		}
+	}
+	return n
+}
+
+func shouldRetryFlareSolverrTransportError(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := strings.ToLower(err.Error())
+	retrySigns := []string{
+		"eof",
+		"context deadline exceeded",
+		"client.timeout exceeded",
+		"connection reset by peer",
+		"i/o timeout",
+	}
+	for _, sign := range retrySigns {
+		if strings.Contains(s, sign) {
+			return true
+		}
+	}
+	return false
 }
 
 func ensureFlareSolverrSessionCached(fsURL, sessionName string) (string, error) {
@@ -1568,6 +2038,49 @@ func extractByRegex(content, regexText string) (string, error) {
 	return strings.TrimSpace(m[1]), nil
 }
 
+func detectOutOfStockHint(content string) string {
+	content = normalizeText(content)
+	if content == "" {
+		return ""
+	}
+	stockPhrases := []string{
+		"无货",
+		"無貨",
+		"缺货",
+		"缺貨",
+		"售罄",
+		"請先查詢",
+		"请先查询",
+		"請查詢",
+		"请查询",
+		"查詢中",
+		"查询中",
+		"待查詢",
+		"待查询",
+		"預訂",
+		"预订",
+		"離線",
+		"离线",
+	}
+	for _, phrase := range stockPhrases {
+		if strings.Contains(content, phrase) {
+			return normalizeStockStatus(phrase)
+		}
+	}
+	return ""
+}
+
+func isOutOfStockError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var oos *outOfStockError
+	if errors.As(err, &oos) {
+		return true
+	}
+	return false
+}
+
 func extractOptionalByRegex(content, regexText string) string {
 	regexText = strings.TrimSpace(regexText)
 	if regexText == "" {
@@ -1646,7 +2159,11 @@ func extractMerchantUpdate(content string, p Product) string {
 	if v := extractOptionalByRegex(content, p.UpdateRegex); v != "" {
 		return formatMerchantUpdate(v)
 	}
-	return formatMerchantUpdate(normalizeText(content))
+	// 兜底时只尝试按店铺模式提取，避免从整页文本误抓日期导致“商户更新”不准确。
+	if v := extractOptionalByRegex(content, buildUpdateRegex(p.StoreName)); v != "" {
+		return formatMerchantUpdate(v)
+	}
+	return ""
 }
 
 func formatMerchantUpdate(raw string) string {
@@ -1658,7 +2175,11 @@ func formatMerchantUpdate(raw string) string {
 	reStock := regexp.MustCompile(`(請先查詢|请先查询|請查詢|请查询|查詢中|查询中|待查詢|待查询|少量存貨|少量存货|有現貨|有现货|現貨|现货|缺貨|缺货|預訂|预订|待定|離線|离线)`)
 	dateMatch := reDate.FindStringSubmatch(raw)
 	if len(dateMatch) < 2 {
-		return raw
+		stockMatch := reStock.FindStringSubmatch(raw)
+		if len(stockMatch) >= 2 {
+			return normalizeStockStatus(stockMatch[1])
+		}
+		return ""
 	}
 	datePart := dateMatch[1] + " 更新"
 	stockMatch := reStock.FindStringSubmatch(raw)
@@ -1738,12 +2259,12 @@ func loggingMiddleware(next http.Handler) http.Handler {
 		if len(ua) > 180 {
 			ua = ua[:180] + "..."
 		}
-		log.Printf("[http][rid=%d] -> %s %s ip=%s ua=%q", reqID, r.Method, path, ip, ua)
+		debugLogf("[http][rid=%d] -> %s %s ip=%s ua=%q", reqID, r.Method, path, ip, ua)
 
 		rec := &responseRecorder{ResponseWriter: w, statusCode: http.StatusOK}
 		panicked := false
 		defer func() {
-			log.Printf("[http][rid=%d] <- %s %s status=%d bytes=%d cost=%s panic=%t", reqID, r.Method, path, rec.statusCode, rec.bytes, time.Since(start), panicked)
+			debugLogf("[http][rid=%d] <- %s %s status=%d bytes=%d cost=%s panic=%t", reqID, r.Method, path, rec.statusCode, rec.bytes, time.Since(start), panicked)
 		}()
 		defer func() {
 			if rv := recover(); rv != nil {
@@ -1840,6 +2361,7 @@ func (a *App) handleProducts(w http.ResponseWriter, r *http.Request) {
 	SELECT p.id, p.name, p.store_name, p.url, p.currency,
 		COALESCE(p.last_fetch_ok, fl.success) AS last_fetch_ok,
 		COALESCE(p.last_fetch_at, fl.fetched_at) AS last_fetch_at,
+		COALESCE(NULLIF(TRIM(p.last_fetch_error), ''), NULLIF(TRIM(fl.error_text), '')) AS last_fetch_error,
 		r.price,
 		(
 			SELECT r3.price
@@ -1881,6 +2403,7 @@ func (a *App) handleProducts(w http.ResponseWriter, r *http.Request) {
 		Currency       string   `json:"currency"`
 		LastFetchOK    *int     `json:"last_fetch_ok"`
 		LastFetchAt    *string  `json:"last_fetch_at"`
+		LastFetchError *string  `json:"last_fetch_error"`
 		Latest         *float64 `json:"latest_price"`
 		PrevPrice      *float64 `json:"prev_price"`
 		LatestDate     *string  `json:"latest_date"`
@@ -1891,7 +2414,7 @@ func (a *App) handleProducts(w http.ResponseWriter, r *http.Request) {
 	var out []row
 	for rows.Next() {
 		var rr row
-		if err := rows.Scan(&rr.ID, &rr.Name, &rr.StoreName, &rr.URL, &rr.Currency, &rr.LastFetchOK, &rr.LastFetchAt, &rr.Latest, &rr.PrevPrice, &rr.LatestDate, &rr.LatestFrom, &rr.UpdatedAt, &rr.MerchantUpdate); err != nil {
+		if err := rows.Scan(&rr.ID, &rr.Name, &rr.StoreName, &rr.URL, &rr.Currency, &rr.LastFetchOK, &rr.LastFetchAt, &rr.LastFetchError, &rr.Latest, &rr.PrevPrice, &rr.LatestDate, &rr.LatestFrom, &rr.UpdatedAt, &rr.MerchantUpdate); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
@@ -1975,104 +2498,192 @@ func (a *App) handleProductHistory(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) handleAddProduct(w http.ResponseWriter, r *http.Request) {
-	type req struct {
-		URL       string `json:"url"`
-		StoreName string `json:"store_name"`
-	}
 	start := time.Now()
 	log.Printf("[add-product] 收到新增请求: remote=%s", r.RemoteAddr)
-	var in req
+	in, ierr := parseAddProductInput(r)
+	if ierr != nil {
+		log.Printf("[add-product] 输入校验失败: %v", ierr)
+		http.Error(w, ierr.Message, ierr.Status)
+		return
+	}
+	log.Printf("[add-product] 参数: url=%s store=%s", in.URL, in.StoreName)
+
+	prepared, ierr := buildAddProductPrepared(in)
+	if ierr != nil {
+		log.Printf("[add-product] 准备新增参数失败: %v", ierr)
+		http.Error(w, ierr.Message, ierr.Status)
+		return
+	}
+
+	if handled := a.tryDedupAddProductAndCollect(w, start, prepared); handled {
+		return
+	}
+
+	pid, dedupByName, err := a.upsertProductByNameForAdd(prepared)
+	if err != nil {
+		log.Printf("[add-product] upsert 数据库记录失败: name=%s err=%v", prepared.Name, err)
+		http.Error(w, "新增失败: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if dedupByName {
+		log.Printf("[add-product] 商品已存在，已更新配置: id=%d name=%s", pid, prepared.Name)
+	} else {
+		log.Printf("[add-product] 新增数据库记录成功: id=%d name=%s", pid, prepared.Name)
+	}
+	a.collectAndRespondForAdd(w, start, pid, prepared.Name, prepared.StoreName, prepared.URL, prepared.PriceRegex, prepared.UpdateRegex, dedupByName)
+}
+
+type addProductReq struct {
+	URL       string `json:"url"`
+	StoreName string `json:"store_name"`
+}
+
+type addProductPrepared struct {
+	URL         string
+	StoreName   string
+	ProductID   string
+	Name        string
+	PriceRegex  string
+	UpdateRegex string
+}
+
+type addProductInputErr struct {
+	Status  int
+	Message string
+	Cause   error
+}
+
+func (e *addProductInputErr) Error() string {
+	if e == nil {
+		return ""
+	}
+	if e.Cause == nil {
+		return e.Message
+	}
+	return e.Message + ": " + e.Cause.Error()
+}
+
+func parseAddProductInput(r *http.Request) (addProductReq, *addProductInputErr) {
+	var in addProductReq
 	if err := json.NewDecoder(io.LimitReader(r.Body, 64*1024)).Decode(&in); err != nil {
-		log.Printf("[add-product] 请求体解析失败: %v", err)
-		http.Error(w, "请求体格式错误", http.StatusBadRequest)
-		return
+		return addProductReq{}, &addProductInputErr{
+			Status:  http.StatusBadRequest,
+			Message: "请求体格式错误",
+			Cause:   err,
+		}
 	}
-	urlText := strings.TrimSpace(in.URL)
-	store := strings.TrimSpace(in.StoreName)
-	log.Printf("[add-product] 参数: url=%s store=%s", urlText, store)
+
+	urlText := normalizeProductURL(strings.TrimSpace(in.URL))
 	if urlText == "" {
-		log.Printf("[add-product] 参数校验失败: url 为空")
-		http.Error(w, "url 不能为空", http.StatusBadRequest)
-		return
-	}
-	urlText = normalizeProductURL(urlText)
-	log.Printf("[add-product] 标准化链接: %s", urlText)
-	if store == "" {
-		store = "Galaxy 銀河攝影器材"
-		log.Printf("[add-product] 店铺为空，使用默认店铺=%s", store)
+		return addProductReq{}, &addProductInputErr{
+			Status:  http.StatusBadRequest,
+			Message: "url 不能为空",
+		}
 	}
 	if !strings.Contains(urlText, "price.com.hk/product.php") {
-		log.Printf("[add-product] 参数校验失败: 非 price.com.hk 商品链接")
-		http.Error(w, "仅支持 price.com.hk 商品链接", http.StatusBadRequest)
-		return
+		return addProductReq{}, &addProductInputErr{
+			Status:  http.StatusBadRequest,
+			Message: "仅支持 price.com.hk 商品链接",
+		}
 	}
-	productID, err := parseProductIDFromURL(urlText)
+	store := strings.TrimSpace(in.StoreName)
+	if store == "" {
+		store = "Galaxy 銀河攝影器材"
+	}
+	return addProductReq{
+		URL:       urlText,
+		StoreName: store,
+	}, nil
+}
+
+func buildAddProductPrepared(in addProductReq) (addProductPrepared, *addProductInputErr) {
+	productID, err := parseProductIDFromURL(in.URL)
 	if err != nil {
-		log.Printf("[add-product] 解析商品ID失败: url=%s err=%v", urlText, err)
-		http.Error(w, "链接中缺少有效商品ID(p)", http.StatusBadRequest)
-		return
+		return addProductPrepared{}, &addProductInputErr{
+			Status:  http.StatusBadRequest,
+			Message: "链接中缺少有效商品ID(p)",
+			Cause:   err,
+		}
 	}
 	log.Printf("[add-product] 解析商品ID成功: product_id=%s", productID)
-	autoName, err := autoDetectProductName(urlText)
-	if err != nil {
-		log.Printf("[add-product] 自动抓取商品名称失败: url=%s err=%v", urlText, err)
-		http.Error(w, "自动抓取商品名称失败: "+err.Error(), http.StatusBadGateway)
-		return
-	}
-	name := buildAutoDisplayName(autoName, store)
-	log.Printf("[add-product] 自动抓取商品名成功: %s", name)
 
-	priceRegex := buildPriceRegex(store, productID)
-	updateRegex := buildUpdateRegex(store)
+	autoName, err := autoDetectProductName(in.URL)
+	if err != nil {
+		return addProductPrepared{}, &addProductInputErr{
+			Status:  http.StatusBadGateway,
+			Message: "自动抓取商品名称失败: " + err.Error(),
+			Cause:   err,
+		}
+	}
+	name := buildAutoDisplayName(autoName, in.StoreName)
+	priceRegex := buildPriceRegex(in.StoreName, productID)
+	updateRegex := buildUpdateRegex(in.StoreName)
+	log.Printf("[add-product] 自动抓取商品名成功: %s", name)
 	log.Printf("[add-product] 生成抓取规则: price_regex=%s update_regex=%s", priceRegex, updateRegex)
-	if existedByURL, existedName, ok := findProductByStoreAndURL(a.db, store, urlText); ok {
+
+	return addProductPrepared{
+		URL:         in.URL,
+		StoreName:   in.StoreName,
+		ProductID:   productID,
+		Name:        name,
+		PriceRegex:  priceRegex,
+		UpdateRegex: updateRegex,
+	}, nil
+}
+
+// tryDedupAddProductAndCollect 优先按“店铺+链接 / 店铺+商品ID”去重，命中后直接更新并触发首次采集响应。
+func (a *App) tryDedupAddProductAndCollect(w http.ResponseWriter, start time.Time, p addProductPrepared) bool {
+	if existedByURL, existedName, ok := findProductByStoreAndURL(a.db, p.StoreName, p.URL); ok {
 		log.Printf("[add-product] 命中去重(店铺+链接): id=%d name=%s", existedByURL, existedName)
-		if _, err := a.db.Exec(`UPDATE products
-			SET url = ?,
-			    price_regex = ?,
-			    update_regex = ?,
-			    currency = 'HKD',
-			    active = 1,
-			    updated_at = datetime('now', '+8 hours')
-			WHERE id = ?`, urlText, priceRegex, updateRegex, existedByURL); err != nil {
+		if err := a.updateProductForAddDedup(existedByURL, p); err != nil {
 			log.Printf("[add-product] 链接去重更新失败: id=%d err=%v", existedByURL, err)
 			http.Error(w, "新增失败: "+err.Error(), http.StatusInternalServerError)
-			return
+			return true
 		}
 		log.Printf("[add-product] 链接去重更新成功: id=%d", existedByURL)
-		nameForUse := name
+		nameForUse := p.Name
 		if existedName != "" {
 			nameForUse = existedName
 		}
-		a.collectAndRespondForAdd(w, start, existedByURL, nameForUse, store, urlText, priceRegex, updateRegex, true)
-		return
+		a.collectAndRespondForAdd(w, start, existedByURL, nameForUse, p.StoreName, p.URL, p.PriceRegex, p.UpdateRegex, true)
+		return true
 	}
-	if existedByPID, existedName, ok := findProductByStoreAndPID(a.db, store, productID); ok {
+
+	if existedByPID, existedName, ok := findProductByStoreAndPID(a.db, p.StoreName, p.ProductID); ok {
 		log.Printf("[add-product] 命中去重(店铺+商品ID): id=%d name=%s", existedByPID, existedName)
-		if _, err := a.db.Exec(`UPDATE products
-			SET url = ?,
-			    price_regex = ?,
-			    update_regex = ?,
-			    currency = 'HKD',
-			    active = 1,
-			    updated_at = datetime('now', '+8 hours')
-			WHERE id = ?`, urlText, priceRegex, updateRegex, existedByPID); err != nil {
+		if err := a.updateProductForAddDedup(existedByPID, p); err != nil {
 			log.Printf("[add-product] 去重更新失败: id=%d err=%v", existedByPID, err)
 			http.Error(w, "新增失败: "+err.Error(), http.StatusInternalServerError)
-			return
+			return true
 		}
 		log.Printf("[add-product] 去重更新成功: id=%d", existedByPID)
-		nameForUse := name
+		nameForUse := p.Name
 		if existedName != "" {
 			nameForUse = existedName
 		}
-		a.collectAndRespondForAdd(w, start, existedByPID, nameForUse, store, urlText, priceRegex, updateRegex, true)
-		return
+		a.collectAndRespondForAdd(w, start, existedByPID, nameForUse, p.StoreName, p.URL, p.PriceRegex, p.UpdateRegex, true)
+		return true
 	}
-	var existedID sql.NullInt64
-	_ = a.db.QueryRow(`SELECT id FROM products WHERE name = ?`, name).Scan(&existedID)
+	return false
+}
 
-	_, err = a.db.Exec(`INSERT INTO products(name, store_name, url, price_regex, update_regex, currency, active, created_at, updated_at)
+func (a *App) updateProductForAddDedup(pid int64, p addProductPrepared) error {
+	_, err := a.db.Exec(`UPDATE products
+		SET url = ?,
+		    price_regex = ?,
+		    update_regex = ?,
+		    currency = 'HKD',
+		    active = 1,
+		    updated_at = datetime('now', '+8 hours')
+		WHERE id = ?`, p.URL, p.PriceRegex, p.UpdateRegex, pid)
+	return err
+}
+
+func (a *App) upsertProductByNameForAdd(p addProductPrepared) (int64, bool, error) {
+	var existedID sql.NullInt64
+	_ = a.db.QueryRow(`SELECT id FROM products WHERE name = ?`, p.Name).Scan(&existedID)
+
+	_, err := a.db.Exec(`INSERT INTO products(name, store_name, url, price_regex, update_regex, currency, active, created_at, updated_at)
 	VALUES(?, ?, ?, ?, ?, 'HKD', 1, datetime('now', '+8 hours'), datetime('now', '+8 hours'))
 	ON CONFLICT(name) DO UPDATE SET
 	store_name=excluded.store_name,
@@ -2082,25 +2693,16 @@ func (a *App) handleAddProduct(w http.ResponseWriter, r *http.Request) {
 	currency='HKD',
 	active=1,
 	updated_at=datetime('now', '+8 hours')`,
-		name, store, urlText, priceRegex, updateRegex)
+		p.Name, p.StoreName, p.URL, p.PriceRegex, p.UpdateRegex)
 	if err != nil {
-		log.Printf("[add-product] upsert 数据库记录失败: name=%s err=%v", name, err)
-		http.Error(w, "新增失败: "+err.Error(), http.StatusBadRequest)
-		return
+		return 0, false, err
 	}
 
 	var pid int64
-	if err := a.db.QueryRow(`SELECT id FROM products WHERE name = ?`, name).Scan(&pid); err != nil || pid <= 0 {
-		log.Printf("[add-product] upsert 成功但查询ID失败: err=%v pid=%d", err, pid)
-		http.Error(w, "新增成功但无法获取商品ID", http.StatusInternalServerError)
-		return
+	if err := a.db.QueryRow(`SELECT id FROM products WHERE name = ?`, p.Name).Scan(&pid); err != nil || pid <= 0 {
+		return 0, false, fmt.Errorf("新增成功但无法获取商品ID: err=%v pid=%d", err, pid)
 	}
-	if existedID.Valid {
-		log.Printf("[add-product] 商品已存在，已更新配置: id=%d name=%s", pid, name)
-	} else {
-		log.Printf("[add-product] 新增数据库记录成功: id=%d name=%s", pid, name)
-	}
-	a.collectAndRespondForAdd(w, start, pid, name, store, urlText, priceRegex, updateRegex, existedID.Valid)
+	return pid, existedID.Valid, nil
 }
 
 func (a *App) collectAndRespondForAdd(
@@ -2110,7 +2712,28 @@ func (a *App) collectAndRespondForAdd(
 	name, store, urlText, priceRegex, updateRegex string,
 	dedup bool,
 ) {
-	newProduct := Product{
+	newProduct := buildProductForAddCollect(pid, name, store, urlText, priceRegex, updateRegex)
+	log.Printf("[add-product][%s] 开始首次抓取: product_id=%d", name, pid)
+	got, ferr := fetchPrice(newProduct)
+	if ferr != nil {
+		a.respondAddProductCollectFailure(w, pid, name, dedup, "首次抓取失败", ferr)
+		return
+	}
+	day := chinaNow().Format("2006-01-02")
+	log.Printf("[add-product][%s] 首次抓取成功，开始写入台账: day=%s", name, day)
+	if err := upsertDailyPrice(a.db, pid, day, store, got.Price, got.RawPrice, got.MerchantUpdate, urlText); err != nil {
+		a.respondAddProductCollectFailure(w, pid, name, dedup, "首次抓取入库失败", err)
+		return
+	}
+	_ = insertFetchLog(a.db, pid, true, "")
+	_ = updateLastFetchStatus(a.db, pid, true, "")
+	log.Printf("[add-product][%s] 首次抓取与入库完成: price=%.2f merchant_update=%s", name, got.Price, got.MerchantUpdate)
+	log.Printf("[add-product] 新增流程完成: id=%d name=%s dedup=%t duration=%s", pid, name, dedup, time.Since(start).String())
+	writeAddProductCollectResp(w, name, dedup, true, "")
+}
+
+func buildProductForAddCollect(pid int64, name, store, urlText, priceRegex, updateRegex string) Product {
+	return Product{
 		ID:          pid,
 		Name:        name,
 		StoreName:   store,
@@ -2120,47 +2743,31 @@ func (a *App) collectAndRespondForAdd(
 		Currency:    "HKD",
 		Active:      true,
 	}
-	log.Printf("[add-product][%s] 开始首次抓取: product_id=%d", name, pid)
-	got, ferr := fetchPrice(newProduct)
-	if ferr != nil {
-		log.Printf("[add-product][%s] 首次抓取失败: %v", name, ferr)
-		_ = insertFetchLog(a.db, pid, false, ferr.Error())
-		_ = updateLastFetchStatus(a.db, pid, false, ferr.Error())
-		writeJSON(w, map[string]any{
-			"status":          "ok",
-			"name":            normalizeProductDisplayName(name),
-			"dedup":           dedup,
-			"initial_collect": "failed",
-			"error":           ferr.Error(),
-		})
-		return
-	}
-	day := chinaNow().Format("2006-01-02")
-	log.Printf("[add-product][%s] 首次抓取成功，开始写入台账: day=%s", name, day)
-	if err := upsertDailyPrice(a.db, pid, day, store, got.Price, got.RawPrice, got.MerchantUpdate, urlText); err != nil {
-		log.Printf("[add-product][%s] 首次抓取入库失败: %v", name, err)
-		_ = insertFetchLog(a.db, pid, false, err.Error())
-		_ = updateLastFetchStatus(a.db, pid, false, err.Error())
-		writeJSON(w, map[string]any{
-			"status":          "ok",
-			"name":            normalizeProductDisplayName(name),
-			"dedup":           dedup,
-			"initial_collect": "failed",
-			"error":           err.Error(),
-		})
-		return
-	}
-	_ = insertFetchLog(a.db, pid, true, "")
-	_ = updateLastFetchStatus(a.db, pid, true, "")
-	log.Printf("[add-product][%s] 首次抓取与入库完成: price=%.2f merchant_update=%s", name, got.Price, got.MerchantUpdate)
-	log.Printf("[add-product] 新增流程完成: id=%d name=%s dedup=%t duration=%s", pid, name, dedup, time.Since(start).String())
+}
 
-	writeJSON(w, map[string]any{
+// respondAddProductCollectFailure 统一处理首次抓取链路失败时的状态写入和响应格式。
+func (a *App) respondAddProductCollectFailure(w http.ResponseWriter, pid int64, name string, dedup bool, stage string, cause error) {
+	log.Printf("[add-product][%s] %s: %v", name, stage, cause)
+	_ = insertFetchLog(a.db, pid, false, cause.Error())
+	_ = updateLastFetchStatus(a.db, pid, false, cause.Error())
+	writeAddProductCollectResp(w, name, dedup, false, cause.Error())
+}
+
+func writeAddProductCollectResp(w http.ResponseWriter, name string, dedup bool, ok bool, errText string) {
+	initialCollect := "failed"
+	if ok {
+		initialCollect = "success"
+	}
+	resp := map[string]any{
 		"status":          "ok",
 		"name":            normalizeProductDisplayName(name),
 		"dedup":           dedup,
-		"initial_collect": "success",
-	})
+		"initial_collect": initialCollect,
+	}
+	if strings.TrimSpace(errText) != "" {
+		resp["error"] = errText
+	}
+	writeJSON(w, resp)
 }
 
 func findProductByStoreAndPID(db *sql.DB, storeName, productID string) (int64, string, bool) {
@@ -2377,6 +2984,25 @@ func (a *App) handleDeleteProduct(w http.ResponseWriter, r *http.Request, idStr 
 		http.NotFound(w, r)
 		return
 	}
+	var pname, pstore, purl string
+	if err := a.db.QueryRow(`SELECT name, store_name, url FROM products WHERE id = ?`, pid).Scan(&pname, &pstore, &purl); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			http.NotFound(w, r)
+			return
+		}
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	cfgPath := envOrDefault("PRODUCTS_CONFIG", "./config/products.json")
+	removed, err := removeProductFromConfig(cfgPath, pname, pstore, purl)
+	if err != nil {
+		http.Error(w, "更新配置文件失败: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if !removed {
+		log.Printf("[delete-product] 配置文件未匹配到目标项，继续删除数据库记录: id=%d name=%s store=%s", pid, pname, pstore)
+	}
 
 	tx, err := a.db.Begin()
 	if err != nil {
@@ -2407,7 +3033,61 @@ func (a *App) handleDeleteProduct(w http.ResponseWriter, r *http.Request, idStr 
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	writeJSON(w, map[string]any{"status": "ok"})
+	writeJSON(w, map[string]any{
+		"status":         "ok",
+		"config_removed": removed,
+	})
+}
+
+func removeProductFromConfig(cfgPath, targetName, targetStore, targetURL string) (bool, error) {
+	b, err := os.ReadFile(cfgPath)
+	if err != nil {
+		return false, err
+	}
+	var list []ProductConfig
+	if err := json.Unmarshal(b, &list); err != nil {
+		return false, fmt.Errorf("解析配置失败: %w", err)
+	}
+
+	targetName = strings.TrimSpace(targetName)
+	targetStore = strings.TrimSpace(targetStore)
+	targetCanonURL, _ := canonicalProductURL(targetURL)
+
+	next := make([]ProductConfig, 0, len(list))
+	removed := false
+	for _, it := range list {
+		if removed {
+			next = append(next, it)
+			continue
+		}
+		nameMatched := strings.TrimSpace(it.Name) == targetName
+		storeMatched := strings.TrimSpace(it.StoreName) == targetStore
+		itemCanonURL, _ := canonicalProductURL(it.URL)
+		urlMatched := targetCanonURL != "" && itemCanonURL != "" && itemCanonURL == targetCanonURL
+		if nameMatched && storeMatched && (urlMatched || strings.TrimSpace(it.URL) == strings.TrimSpace(targetURL)) {
+			removed = true
+			continue
+		}
+		next = append(next, it)
+	}
+	if !removed {
+		return false, nil
+	}
+
+	out, err := json.MarshalIndent(next, "", "  ")
+	if err != nil {
+		return false, fmt.Errorf("序列化配置失败: %w", err)
+	}
+	out = append(out, '\n')
+	tmp := cfgPath + ".tmp"
+	if err := os.WriteFile(tmp, out, 0644); err != nil {
+		return false, err
+	}
+	if err := os.Rename(tmp, cfgPath); err != nil {
+		_ = os.Remove(tmp)
+		return false, err
+	}
+	return true, nil
 }
 
 func parseProductIDFromURL(urlText string) (string, error) {
@@ -2448,7 +3128,7 @@ func buildUpdateRegex(storeName string) string {
 	if strings.Contains(storeName, "順星") || strings.Contains(strings.ToLower(storeName), "顺星") {
 		return "(?:順星數碼|顺星数码)[\\s\\S]*?([0-9]{4}-[0-9]{2}-[0-9]{2}\\s*更新(?:[\\s\\S]{0,120}?(?:請先查詢|请先查询|少量存貨|少量存货|有現貨|有现货|現貨|现货|缺貨|缺货|預訂|预订|待定|離線|离线))?)"
 	}
-	return "Galaxy\\s*銀河攝影器材[\\s\\S]*?([0-9]{4}-[0-9]{2}-[0-9]{2}\\s*更新(?:[\\s\\S]{0,120}?(?:請先查詢|请先查询|少量存貨|少量存货|有現貨|有现货|現貨|现货|缺貨|缺货|預訂|预订|待定|離線|离线))?)"
+	return "Galaxy\\s*(?:銀河|银河)攝影器材[\\s\\S]*?([0-9]{4}-[0-9]{2}-[0-9]{2}\\s*更新(?:[\\s\\S]{0,120}?(?:請先查詢|请先查询|少量存貨|少量存货|有現貨|有现货|現貨|现货|缺貨|缺货|預訂|预订|待定|離線|离线))?)"
 }
 
 func (a *App) handleCollect(w http.ResponseWriter, r *http.Request) {
@@ -2671,42 +3351,6 @@ func sendFlareSolverrConnectivityAlertToWeCom(scene, fsURL string, cause error) 
 	return sendWeComMarkdown(webhook, content)
 }
 
-func sendCollectFailureAlertToWeCom(day string, successCount, failCount int, failures []collectFailureDetail, blockedByWAF, flareConnIssue bool) error {
-	webhook := weComWebhook()
-	if webhook == "" {
-		return fmt.Errorf("未配置 WECHAT_BOT_WEBHOOK")
-	}
-	now := chinaNow().Format("2006-01-02 15:04:05")
-	builder := strings.Builder{}
-	builder.WriteString("### 价格采集异常告警\n")
-	builder.WriteString("> 时间: " + now + "\n")
-	builder.WriteString("> 采集日期: " + trimAlertText(day, 32) + "\n")
-	builder.WriteString(fmt.Sprintf("> 结果: success=%d failed=%d\n", successCount, failCount))
-	if blockedByWAF {
-		builder.WriteString("> 风险: 检测到 Cloudflare 挑战页\n")
-	}
-	if flareConnIssue {
-		builder.WriteString("> 风险: 检测到 FlareSolverr 连接异常（172.25.0.102）\n")
-		builder.WriteString("> 节点: " + trimAlertText(flareSolverrURL(), 120) + "\n")
-	}
-	if len(failures) > 0 {
-		builder.WriteString("\n失败明细（最多 5 条）:\n")
-		limit := len(failures)
-		if limit > 5 {
-			limit = 5
-		}
-		for i := 0; i < limit; i++ {
-			f := failures[i]
-			builder.WriteString(fmt.Sprintf("- %s（%s）：%s\n",
-				trimAlertText(f.ProductName, 80),
-				trimAlertText(f.StoreName, 60),
-				trimAlertText(f.Err, 180),
-			))
-		}
-	}
-	return sendWeComMarkdown(webhook, builder.String())
-}
-
 func sendPricePushToWeCom(db *sql.DB) error {
 	webhook := weComWebhook()
 	if webhook == "" {
@@ -2718,7 +3362,7 @@ func sendPricePushToWeCom(db *sql.DB) error {
 		return err
 	}
 	if len(lines) == 0 {
-		return fmt.Errorf("无可推送的价格数据")
+		return fmt.Errorf("无当天更新价格数据")
 	}
 
 	now := chinaNow().Format("2006-01-02 15:04:05")
@@ -2776,8 +3420,9 @@ func getPushFXRate(db *sql.DB) (float64, string) {
 }
 
 func buildPricePushLines(db *sql.DB, fxRate float64) ([]string, error) {
+	today := chinaNow().Format("2006-01-02")
 	rows, err := db.Query(`
-	SELECT p.name, p.store_name, r.price,
+	SELECT p.name, p.store_name, r.price, r.record_date, r.merchant_update,
 		(
 			SELECT r2.price
 			FROM price_records r2
@@ -2809,12 +3454,23 @@ func buildPricePushLines(db *sql.DB, fxRate float64) ([]string, error) {
 		var name string
 		var store string
 		var latest sql.NullFloat64
+		var recordDate sql.NullString
+		var merchantUpdate sql.NullString
 		var prev sql.NullFloat64
-		if err := rows.Scan(&name, &store, &latest, &prev); err != nil {
+		if err := rows.Scan(&name, &store, &latest, &recordDate, &merchantUpdate, &prev); err != nil {
 			return nil, err
 		}
 		name = normalizeProductBaseName(normalizeProductDisplayName(name))
 		if !latest.Valid {
+			continue
+		}
+		recordDay := strings.TrimSpace(recordDate.String)
+		merchantDay := extractDateYMD(merchantUpdate.String)
+		if merchantDay != "" {
+			if merchantDay != today {
+				continue
+			}
+		} else if recordDay != today {
 			continue
 		}
 		hkd := latest.Float64
@@ -2858,6 +3514,19 @@ func buildPricePushLines(db *sql.DB, fxRate float64) ([]string, error) {
 		lines = append(lines, fmt.Sprintf("- %s：%s", name, strings.Join(parts, "；")))
 	}
 	return lines, nil
+}
+
+func extractDateYMD(raw string) string {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return ""
+	}
+	re := regexp.MustCompile(`([0-9]{4}-[0-9]{2}-[0-9]{2})`)
+	m := re.FindStringSubmatch(s)
+	if len(m) >= 2 {
+		return m[1]
+	}
+	return ""
 }
 
 func mustLoadChinaLocation() *time.Location {
