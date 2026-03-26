@@ -761,6 +761,11 @@ func runSchedule(db *sql.DB) error {
 				timer := time.NewTimer(wait)
 				<-timer.C
 				timer.Stop()
+				at := time.Now().In(loc)
+				if containsDailySlot(collectSlots, at.Hour(), at.Minute()) {
+					log.Printf("[schedule] 当前时刻命中定时采集窗口(%02d:%02d)，本次失败补采让路跳过", at.Hour(), at.Minute())
+					continue
+				}
 				log.Printf("[schedule] 到达失败补采检查时间，开始检查失败商品")
 				if err := collectFailedProducts(db); err != nil {
 					log.Printf("[schedule] 失败补采执行结果: %v", err)
@@ -872,6 +877,15 @@ func formatDailySlots(slots []dailySlot) string {
 		parts = append(parts, fmt.Sprintf("%02d:%02d", s.Hour, s.Minute))
 	}
 	return strings.Join(parts, ",")
+}
+
+func containsDailySlot(slots []dailySlot, hour, minute int) bool {
+	for _, s := range slots {
+		if s.Hour == hour && s.Minute == minute {
+			return true
+		}
+	}
+	return false
 }
 
 func collectFailedRetryInterval() time.Duration {
