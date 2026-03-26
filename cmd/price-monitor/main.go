@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"database/sql"
 	"encoding/json"
@@ -3890,11 +3891,108 @@ func (a *App) handleRuntimeLogs(w http.ResponseWriter, r *http.Request) {
 			sinceID = n
 		}
 	}
-	lines, latestID := runtimeMon.logsSince(sinceID, limit)
+	logDir := envOrDefault("LOG_DIR", "./logs")
+	lines, latestID, err := readRuntimeLogsFromFile(logDir, sinceID, limit)
+	if err != nil {
+		debugLogf("[runtime-logs] 读取日志文件失败，回退内存日志: dir=%s err=%v", logDir, err)
+		lines, latestID = runtimeMon.logsSince(sinceID, limit)
+	}
 	writeJSON(w, map[string]any{
 		"lines":     lines,
 		"latest_id": latestID,
 	})
+}
+
+func readRuntimeLogsFromFile(logDir string, sinceID int64, limit int) ([]runtimeLogEntry, int64, error) {
+	if limit <= 0 {
+		limit = 200
+	}
+	if limit > 1000 {
+		limit = 1000
+	}
+	path, err := resolveLatestLogFile(logDir)
+	if err != nil {
+		return nil, 0, err
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer f.Close()
+
+	sc := bufio.NewScanner(f)
+	const maxLine = 2 * 1024 * 1024
+	buf := make([]byte, 0, 64*1024)
+	sc.Buffer(buf, maxLine)
+
+	total := int64(0)
+	out := make([]runtimeLogEntry, 0, limit)
+	for sc.Scan() {
+		total++
+		if total <= sinceID {
+			continue
+		}
+		raw := strings.TrimSpace(sc.Text())
+		if raw == "" {
+			continue
+		}
+		ts, msg := splitLogLine(raw)
+		out = append(out, runtimeLogEntry{
+			ID:   total,
+			TS:   ts,
+			Line: msg,
+		})
+		if len(out) > limit {
+			out = out[len(out)-limit:]
+		}
+	}
+	if err := sc.Err(); err != nil {
+		return nil, 0, err
+	}
+	// 日志文件发生轮转或截断时，since_id 可能大于最新行号。此时返回最后 limit 行，避免前端“空白且不再更新”。
+	if sinceID > total {
+		return readRuntimeLogsFromFile(logDir, 0, limit)
+	}
+	return out, total, nil
+}
+
+func resolveLatestLogFile(logDir string) (string, error) {
+	today := filepath.Join(logDir, chinaNow().Format("2006-01-02")+".log")
+	if st, err := os.Stat(today); err == nil && !st.IsDir() {
+		return today, nil
+	}
+	matches, err := filepath.Glob(filepath.Join(logDir, "*.log"))
+	if err != nil {
+		return "", err
+	}
+	if len(matches) == 0 {
+		return "", fmt.Errorf("日志文件不存在: dir=%s", logDir)
+	}
+	sort.Strings(matches)
+	return matches[len(matches)-1], nil
+}
+
+func splitLogLine(raw string) (string, string) {
+	// 预期格式: 2026/03/26 10:00:00.123456 [tag] message
+	if len(raw) >= 19 && raw[4] == '/' && raw[7] == '/' && raw[10] == ' ' {
+		end := 19
+		if len(raw) > end && raw[end] == '.' {
+			i := end + 1
+			for ; i < len(raw); i++ {
+				if raw[i] < '0' || raw[i] > '9' {
+					break
+				}
+			}
+			end = i
+		}
+		ts := strings.ReplaceAll(raw[:end], "/", "-")
+		line := strings.TrimSpace(raw[end:])
+		if line == "" {
+			line = raw
+		}
+		return ts, line
+	}
+	return "", raw
 }
 
 func (a *App) getTodayHKDCNYRate() (float64, string, string, error) {
