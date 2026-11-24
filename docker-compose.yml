@@ -16,7 +16,7 @@ services:
       SCHEDULE_TZ: "Asia/Shanghai"
       TZ: "Asia/Shanghai"
       FLARESOLVERR_V2: "true"
-      FLARESOLVERR_URL: "http://172.25.0.102:8191/v1"
+      FLARESOLVERR_URL: "http://172.25.8.16:8191/v1"
       ENABLE_FLARESOLVERR_FALLBACK: "true"
       ENABLE_BROWSER_FALLBACK: "false"
       FLARESOLVERR_HTTP_TIMEOUT_SECONDS: "240"
@@ -39,6 +39,7 @@ services:
       PLAYWRIGHT_EXTRA_ARGS: "--disable-dev-shm-usage"
       COLLECT_ITEM_DELAY_MS: "2500"
       WECHAT_BOT_WEBHOOK: "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=b109bcf8-2316-4015-9a8f-7c3770799f0c"
+      FEISHU_BOT_WEBHOOK: "${FEISHU_BOT_WEBHOOK:-}"
     volumes:
       - /root/priceMonitoring/data:/app/data
       - /root/priceMonitoring/logs:/app/logs

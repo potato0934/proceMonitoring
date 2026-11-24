@@ -68,7 +68,7 @@ type FetchResult struct {
 }
 
 var chinaLoc = mustLoadChinaLocation()
-var defaultFlareSolverrURL = "http://172.25.0.102:8191/v1"
+var defaultFlareSolverrURL = "http://172.25.8.16:8191/v1"
 var defaultBasePath = ""
 var defaultWeComWebhook = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=b109bcf8-2316-4015-9a8f-7c3770799f0c"
 var flareSolverrCB flaresolverrCircuitBreaker
@@ -1119,7 +1119,8 @@ func ensureStoreOptionsInit(db *sql.DB) error {
 	}
 	if _, err := db.Exec(`INSERT OR IGNORE INTO store_options(name) VALUES
 		('Galaxy 銀河攝影器材'),
-		('順星數碼')`); err != nil {
+		('順星數碼'),
+		('大時代攝影器材')`); err != nil {
 		return err
 	}
 	if _, err := db.Exec(`INSERT OR IGNORE INTO store_options(name)
@@ -1342,6 +1343,12 @@ type pendingCollectFailure struct {
 	firstErr error
 }
 
+type priceChange struct {
+	Product Product
+	Old     float64
+	New     float64
+}
+
 // collectRunState 聚合一轮采集的统计与失败样本，避免在主流程中散落大量计数和写库细节。
 type collectRunState struct {
 	runLabel        string
@@ -1453,6 +1460,7 @@ func runCollectForProducts(db *sql.DB, products []Product, runLabel string) erro
 	runtimeMon.beginCollectRun(runLabel, len(urlGroups), len(products))
 	defer runtimeMon.clearCurrentTask()
 	state := newCollectRunState(runLabel)
+	changes := make([]priceChange, 0, len(products))
 	for i, g := range urlGroups {
 		runtimeMon.setCollectGroup(i+1, len(urlGroups), len(g.Items), g.URL)
 		if i > 0 {
@@ -1500,6 +1508,12 @@ func runCollectForProducts(db *sql.DB, products []Product, runLabel string) erro
 			}
 			debugLogf("[collect][%s][%s] 抓取完成，准备写入数据库", runLabel, p.Name)
 			runtimeMon.setCurrentTask(p, "写入数据库")
+			if oldPrice, ok, qerr := getLatestPriceBefore(db, p.ID); qerr != nil {
+				state.markFailure(db, p, qerr.Error())
+				continue
+			} else if ok && pricesDiffer(oldPrice, got.Price) {
+				changes = append(changes, priceChange{Product: p, Old: oldPrice, New: got.Price})
+			}
 			err = upsertDailyPrice(db, p.ID, today, p.StoreName, got.Price, got.RawPrice, got.MerchantUpdate, p.URL)
 			if err != nil {
 				log.Printf("[collect][%s][%s] 写入失败: %v", runLabel, p.Name, err)
@@ -1541,6 +1555,12 @@ func runCollectForProducts(db *sql.DB, products []Product, runLabel string) erro
 						continue
 					}
 					runtimeMon.setCurrentTask(pf.product, "补抓写入")
+					if oldPrice, ok, qerr := getLatestPriceBefore(db, pf.product.ID); qerr != nil {
+						state.markFailure(db, pf.product, qerr.Error())
+						continue
+					} else if ok && pricesDiffer(oldPrice, got.Price) {
+						changes = append(changes, priceChange{Product: pf.product, Old: oldPrice, New: got.Price})
+					}
 					if werr := upsertDailyPrice(db, pf.product.ID, today, pf.product.StoreName, got.Price, got.RawPrice, got.MerchantUpdate, pf.product.URL); werr != nil {
 						finalErr := fmt.Sprintf("首次解析失败: %v; 补抓写入失败: %v", pf.firstErr, werr)
 						state.markFailure(db, pf.product, finalErr)
@@ -1569,6 +1589,11 @@ func runCollectForProducts(db *sql.DB, products []Product, runLabel string) erro
 		return err
 	}
 	runtimeMon.finishCollectRun("success", nil)
+	if len(changes) > 0 {
+		if err := sendPriceChangesToFeishu(db, changes); err != nil {
+			log.Printf("[feishu] 价格变动推送失败: %v", err)
+		}
+	}
 	return nil
 }
 
@@ -1621,7 +1646,7 @@ func shouldCheckFlareSolverrBeforeCollect() bool {
 	if !useFlareSolverrFallback() {
 		return false
 	}
-	return isFlareSolverrTargetHost(flareSolverrURL(), "172.25.0.102")
+	return isFlareSolverrTargetHost(flareSolverrURL(), "172.25.8.16")
 }
 
 func ensureFlareSolverrReachableWithRetry() error {
@@ -1912,13 +1937,13 @@ func flareSolverrPreflightRetryInterval() time.Duration {
 
 func maybeNotifyFlareSolverrConnectivityAlert(scene string, err error) {
 	fsURL := flareSolverrURL()
-	if !isFlareSolverrTargetHost(fsURL, "172.25.0.102") {
+	if !isFlareSolverrTargetHost(fsURL, "172.25.8.16") {
 		return
 	}
 	if !isFlareSolverrConnectivityError(err) {
 		return
 	}
-	if !shouldSendWeComAlert("flaresolverr-connectivity-172.25.0.102", 10*time.Minute) {
+	if !shouldSendWeComAlert("flaresolverr-connectivity-172.25.8.16", 10*time.Minute) {
 		log.Printf("[alert] FlareSolverr连接告警抑制（冷却中）: scene=%s", scene)
 		return
 	}
@@ -2350,8 +2375,12 @@ func callFlareSolverr(fsURL string, payload map[string]any, timeout time.Duratio
 			return flareSolverrResp{}, rerr
 		}
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-			log.Printf("[flaresolverr] 调用失败: cmd=%s status=%d", cmd, resp.StatusCode)
-			return flareSolverrResp{}, fmt.Errorf("FlareSolverr HTTP 状态异常: %d", resp.StatusCode)
+			bodyText := strings.TrimSpace(string(body))
+			if len(bodyText) > 500 {
+				bodyText = bodyText[:500]
+			}
+			log.Printf("[flaresolverr] 调用失败: cmd=%s status=%d body=%s", cmd, resp.StatusCode, bodyText)
+			return flareSolverrResp{}, fmt.Errorf("FlareSolverr HTTP 状态异常: %d: %s", resp.StatusCode, bodyText)
 		}
 
 		var out flareSolverrResp
@@ -2549,6 +2578,24 @@ func upsertDailyPrice(db *sql.DB, productID int64, day, storeName string, price 
 	source_url=excluded.source_url,
 	updated_at=datetime('now', '+8 hours')`, productID, day, price, storeName, merchantUpdate, rawText, sourceURL)
 	return err
+}
+
+func getLatestPriceBefore(db *sql.DB, productID int64) (float64, bool, error) {
+	var price sql.NullFloat64
+	err := db.QueryRow(`SELECT price FROM price_records
+		WHERE product_id = ?
+		ORDER BY record_date DESC, updated_at DESC, id DESC LIMIT 1`, productID).Scan(&price)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, err
+	}
+	return price.Float64, price.Valid, nil
+}
+
+func pricesDiffer(oldPrice, newPrice float64) bool {
+	return math.Abs(oldPrice-newPrice) >= 0.005
 }
 
 func insertFetchLog(db *sql.DB, productID int64, ok bool, errText string) error {
@@ -3330,52 +3377,66 @@ func autoDetectProductName(urlText string) (string, error) {
 	ua := "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
 	var content string
 
+	// 商品名通常直接位于 HTML 标题中，先走轻量 HTTP，失败后再使用 FlareSolverr。
+	{
+		var httpErr error
+		client := newBrowserLikeClient()
+		_ = warmUpHome(client, urlText, ua)
+		req, err := http.NewRequest(http.MethodGet, urlText, nil)
+		if err != nil {
+			httpErr = err
+		}
+		if httpErr == nil {
+			req.Header.Set("User-Agent", ua)
+			req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+			req.Header.Set("Accept-Language", "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7")
+			req.Header.Set("Referer", "https://www.price.com.hk/")
+			resp, err := client.Do(req)
+			if err != nil {
+				log.Printf("[add-product][name-detect] HTTP 请求失败: %v", err)
+				httpErr = err
+			}
+			if httpErr == nil {
+				defer resp.Body.Close()
+				b, _ := io.ReadAll(io.LimitReader(resp.Body, 2*1024*1024))
+				if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+					log.Printf("[add-product][name-detect] HTTP 状态异常: %d", resp.StatusCode)
+					httpErr = fmt.Errorf("status=%d", resp.StatusCode)
+				} else {
+					content = string(b)
+					log.Printf("[add-product][name-detect] HTTP 抓取成功")
+				}
+			}
+		}
+	}
+
+	name := extractPageProductName(content)
+	if name != "" {
+		log.Printf("[add-product][name-detect] HTTP 页面解析成功: name=%s", name)
+		return name, nil
+	}
+
 	if useFlareSolverrFallback() {
 		fsURL := flareSolverrURL()
 		sessionName := flareSolverrSessionName()
 		httpTimeout := flareSolverrRequestHTTPTimeout()
 		maxTimeoutMS := flareSolverrMaxTimeoutMS()
-		log.Printf("[add-product][name-detect] 尝试 FlareSolverr: url=%s session=%s", fsURL, sessionName)
-		_, _ = ensureFlareSolverrSessionCached(fsURL, sessionName)
-		resp, err := callFlareSolverr(fsURL, newFlareSolverrRequestGetPayload(urlText, sessionName, maxTimeoutMS), httpTimeout)
-		if err == nil && !looksLikeCloudflareChallenge(resp.Solution.Response) {
-			content = resp.Solution.Response
-			log.Printf("[add-product][name-detect] FlareSolverr 成功获取页面")
-		} else if err != nil {
-			log.Printf("[add-product][name-detect] FlareSolverr 失败: %v", err)
+		log.Printf("[add-product][name-detect] HTTP 未解析到商品名，尝试 FlareSolverr: url=%s session=%s", fsURL, sessionName)
+		if _, err := ensureFlareSolverrSessionCached(fsURL, sessionName); err == nil {
+			resp, ferr := callFlareSolverr(fsURL, newFlareSolverrRequestGetPayload(urlText, sessionName, maxTimeoutMS), httpTimeout)
+			if ferr == nil && !looksLikeCloudflareChallenge(resp.Solution.Response) {
+				name = extractPageProductName(resp.Solution.Response)
+				if name != "" {
+					log.Printf("[add-product][name-detect] FlareSolverr 页面解析成功: name=%s", name)
+					return name, nil
+				}
+			} else if ferr != nil {
+				log.Printf("[add-product][name-detect] FlareSolverr 失败: %v", ferr)
+			}
 		} else {
-			log.Printf("[add-product][name-detect] FlareSolverr 返回挑战页")
+			log.Printf("[add-product][name-detect] FlareSolverr 会话不可用")
 		}
 	}
-
-	if content == "" {
-		log.Printf("[add-product][name-detect] 回退 HTTP 抓取商品页")
-		client := newBrowserLikeClient()
-		_ = warmUpHome(client, urlText, ua)
-		req, err := http.NewRequest(http.MethodGet, urlText, nil)
-		if err != nil {
-			return "", err
-		}
-		req.Header.Set("User-Agent", ua)
-		req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
-		req.Header.Set("Accept-Language", "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7")
-		req.Header.Set("Referer", "https://www.price.com.hk/")
-		resp, err := client.Do(req)
-		if err != nil {
-			log.Printf("[add-product][name-detect] HTTP 请求失败: %v", err)
-			return "", err
-		}
-		defer resp.Body.Close()
-		b, _ := io.ReadAll(io.LimitReader(resp.Body, 2*1024*1024))
-		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-			log.Printf("[add-product][name-detect] HTTP 状态异常: %d", resp.StatusCode)
-			return "", fmt.Errorf("status=%d", resp.StatusCode)
-		}
-		content = string(b)
-		log.Printf("[add-product][name-detect] HTTP 抓取成功")
-	}
-
-	name := extractPageProductName(content)
 	if name == "" {
 		log.Printf("[add-product][name-detect] 页面解析失败: 未提取到商品名")
 		return "", fmt.Errorf("未从页面提取到商品名")
@@ -3407,18 +3468,29 @@ func extractPageProductName(content string) string {
 }
 
 func buildAutoDisplayName(base, store string) string {
-	base = normalizeProductBaseName(base)
+	// 页面标题可能已经带有另一家店铺的旧后缀，先剥掉再按当前店铺生成。
+	base = normalizeProductBaseName(normalizeProductDisplayName(base))
 	if base == "" {
 		base = "Product"
 	}
-	tag := "Galaxy 水貨"
-	if strings.Contains(store, "順星") || strings.Contains(store, "顺星") {
-		tag = "順星水貨"
-	}
+	tag := storeWaterGoodsTag(store)
 	if strings.Contains(base, tag) {
 		return base
 	}
 	return fmt.Sprintf("%s (%s)", base, tag)
+}
+
+func storeWaterGoodsTag(store string) string {
+	switch {
+	case strings.Contains(store, "順星") || strings.Contains(store, "顺星"):
+		return "順星水貨"
+	case strings.Contains(store, "大時代") || strings.Contains(store, "大时代"):
+		return "大時代水貨"
+	case strings.Contains(store, "Galaxy") || strings.Contains(store, "銀河") || strings.Contains(store, "银河"):
+		return "Galaxy 水貨"
+	default:
+		return strings.TrimSpace(store) + " 水貨"
+	}
 }
 
 func normalizeProductBaseName(base string) string {
@@ -3439,7 +3511,7 @@ func normalizeProductBaseName(base string) string {
 
 func normalizeProductDisplayName(name string) string {
 	s := strings.TrimSpace(name)
-	re := regexp.MustCompile(`\s*\((?:Galaxy\s*水貨|Galaxy\s*水货|順星水貨|顺星水货|順星數碼\s*水貨|顺星数码\s*水货)\)\s*$`)
+	re := regexp.MustCompile(`\s*\((?:Galaxy\s*水貨|Galaxy\s*水货|順星水貨|顺星水货|順星數碼\s*水貨|顺星数码\s*水货|大時代水貨|大时代水货)\)\s*$`)
 	s = re.ReplaceAllString(s, "")
 	return strings.TrimSpace(s)
 }
@@ -3644,17 +3716,30 @@ func normalizeProductURL(raw string) string {
 }
 
 func buildPriceRegex(storeName, productID string) string {
-	if strings.Contains(storeName, "順星") || strings.Contains(strings.ToLower(storeName), "顺星") {
-		return "(?:順星數碼|顺星数码)[\\s\\S]*?product_id=" + productID + "[\\s\\S]*?tr_pw=([0-9.]+)[\\s\\S]*?tr_so=w"
+	merchantID := ""
+	switch {
+	case strings.Contains(storeName, "順星") || strings.Contains(strings.ToLower(storeName), "顺星"):
+		merchantID = ""
+	case strings.Contains(storeName, "大時代") || strings.Contains(storeName, "大时代"):
+		merchantID = "2868"
+	default:
+		merchantID = "9146"
 	}
-	return "merchant_id=9146[\\s\\S]*?product_id=" + productID + "[\\s\\S]*?tr_pw=([0-9.]+)[\\s\\S]*?tr_so=w"
+	if merchantID != "" {
+		return "merchant_id=" + merchantID + "[\\s\\S]*?product_id=" + productID + "[\\s\\S]*?tr_pw=([0-9.]+)[\\s\\S]*?tr_so=w"
+	}
+	return "(?:順星數碼|顺星数码)[\\s\\S]*?product_id=" + productID + "[\\s\\S]*?tr_pw=([0-9.]+)[\\s\\S]*?tr_so=w"
 }
 
 func buildUpdateRegex(storeName string) string {
 	if strings.Contains(storeName, "順星") || strings.Contains(strings.ToLower(storeName), "顺星") {
 		return "(?:順星數碼|顺星数码)[\\s\\S]*?([0-9]{4}-[0-9]{2}-[0-9]{2}\\s*更新(?:[\\s\\S]{0,120}?(?:請先查詢|请先查询|少量存貨|少量存货|有現貨|有现货|現貨|现货|缺貨|缺货|預訂|预订|待定|離線|离线))?)"
 	}
-	return "Galaxy\\s*(?:銀河|银河)攝影器材[\\s\\S]*?([0-9]{4}-[0-9]{2}-[0-9]{2}\\s*更新(?:[\\s\\S]{0,120}?(?:請先查詢|请先查询|少量存貨|少量存货|有現貨|有现货|現貨|现货|缺貨|缺货|預訂|预订|待定|離線|离线))?)"
+	storePattern := regexp.QuoteMeta(strings.TrimSpace(storeName))
+	if storePattern == "" {
+		storePattern = "Galaxy\\s*(?:銀河|银河)攝影器材"
+	}
+	return storePattern + "[\\s\\S]*?([0-9]{4}-[0-9]{2}-[0-9]{2}\\s*更新(?:[\\s\\S]{0,120}?(?:請先查詢|请先查询|少量存貨|少量存货|有現貨|有现货|現貨|现货|缺貨|缺货|預訂|预订|待定|離線|离线))?)"
 }
 
 func (a *App) handleCollect(w http.ResponseWriter, r *http.Request) {
@@ -4205,36 +4290,37 @@ func sendPricePushToWeCom(db *sql.DB) error {
 }
 
 func sendWeComMarkdown(webhook, content string) error {
-	payload := map[string]any{
-		"msgtype": "markdown",
-		"markdown": map[string]string{
-			"content": content,
-		},
-	}
-	b, _ := json.Marshal(payload)
-	req, err := http.NewRequest(http.MethodPost, webhook, bytes.NewReader(b))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := (&http.Client{Timeout: 15 * time.Second}).Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024*1024))
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("企业微信HTTP状态异常: %d", resp.StatusCode)
-	}
-	var out struct {
-		ErrCode int    `json:"errcode"`
-		ErrMsg  string `json:"errmsg"`
-	}
-	if err := json.Unmarshal(body, &out); err == nil {
-		if out.ErrCode != 0 {
-			return fmt.Errorf("企业微信返回失败: errcode=%d errmsg=%s", out.ErrCode, out.ErrMsg)
-		}
-	}
+	// 不通知企业微信了
+	//payload := map[string]any{
+	//	"msgtype": "markdown",
+	//	"markdown": map[string]string{
+	//		"content": content,
+	//	},
+	//}
+	//b, _ := json.Marshal(payload)
+	//req, err := http.NewRequest(http.MethodPost, webhook, bytes.NewReader(b))
+	//if err != nil {
+	//	return err
+	//}
+	//req.Header.Set("Content-Type", "application/json")
+	//resp, err := (&http.Client{Timeout: 15 * time.Second}).Do(req)
+	//if err != nil {
+	//	return err
+	//}
+	//defer resp.Body.Close()
+	//body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024*1024))
+	//if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+	//	return fmt.Errorf("企业微信HTTP状态异常: %d", resp.StatusCode)
+	//}
+	//var out struct {
+	//	ErrCode int    `json:"errcode"`
+	//	ErrMsg  string `json:"errmsg"`
+	//}
+	//if err := json.Unmarshal(body, &out); err == nil {
+	//	if out.ErrCode != 0 {
+	//		return fmt.Errorf("企业微信返回失败: errcode=%d errmsg=%s", out.ErrCode, out.ErrMsg)
+	//	}
+	//}
 	return nil
 }
 
@@ -4244,8 +4330,10 @@ func getPushFXRate(db *sql.DB) (float64, string) {
 			return rate, "env"
 		}
 	}
-	if rate, day, source, ok := getLatestStoredFXRate(db, "HKD", "CNY"); ok && rate > 0 {
-		return rate, day + " " + source
+	if db != nil {
+		if rate, day, source, ok := getLatestStoredFXRate(db, "HKD", "CNY"); ok && rate > 0 {
+			return rate, day + " " + source
+		}
 	}
 	return 0.92, "fallback"
 }
@@ -4345,6 +4433,119 @@ func buildPricePushLines(db *sql.DB, fxRate float64) ([]string, error) {
 		lines = append(lines, fmt.Sprintf("- %s：%s", name, strings.Join(parts, "；")))
 	}
 	return lines, nil
+}
+
+func sendPriceChangesToFeishu(db *sql.DB, changes []priceChange) error {
+	webhook := strings.TrimSpace(os.Getenv("FEISHU_BOT_WEBHOOK"))
+	if webhook == "" || len(changes) == 0 {
+		return nil
+	}
+	fxRate, fxSource := getPushFXRate(db)
+
+	seen := make(map[int64]struct{}, len(changes))
+	lines := make([]string, 0, len(changes))
+	for _, change := range changes {
+		if _, ok := seen[change.Product.ID]; ok {
+			continue
+		}
+		seen[change.Product.ID] = struct{}{}
+		line, err := formatFeishuPriceChange(change, fxRate)
+		if err != nil {
+			return err
+		}
+		lines = append(lines, line)
+	}
+	if len(lines) == 0 {
+		return nil
+	}
+
+	content := "价格发生变动\n时间：" + chinaNow().Format("2006-01-02 15:04:05") +
+		fmt.Sprintf("\n汇率：1 HKD = %.4f CNY（%s）\n\n", fxRate, fxSource) + strings.Join(lines, "\n")
+	return sendFeishuText(webhook, content)
+}
+
+func formatFeishuPriceChange(change priceChange, fxRate float64) (string, error) {
+	currency := strings.ToUpper(strings.TrimSpace(change.Product.Currency))
+	if currency == "" {
+		currency = "CNY"
+	}
+	oldCNY, err := convertPriceToCNY(change.Old, currency, fxRate)
+	if err != nil {
+		return "", err
+	}
+	newCNY, err := convertPriceToCNY(change.New, currency, fxRate)
+	if err != nil {
+		return "", err
+	}
+	direction := " → "
+	if change.New > change.Old {
+		direction = " ↑ "
+	} else if change.New < change.Old {
+		direction = " ↓ "
+	}
+	name := normalizeProductBaseName(normalizeProductDisplayName(change.Product.Name))
+	return fmt.Sprintf("- %s（%s）：%s｜CNY %.2f（原价 %s %.2f）→ CNY %.2f（原价 %s %.2f）",
+		name, change.Product.StoreName, direction, oldCNY, currency, change.Old, newCNY, currency, change.New), nil
+}
+
+func convertPriceToCNY(price float64, currency string, fxRate float64) (float64, error) {
+	switch strings.ToUpper(strings.TrimSpace(currency)) {
+	case "CNY", "RMB", "CNH":
+		return price, nil
+	case "HKD":
+		if fxRate <= 0 {
+			return 0, fmt.Errorf("HKD 转 CNY 汇率无效: %.6f", fxRate)
+		}
+		return math.Round(price*fxRate*100) / 100, nil
+	default:
+		return 0, fmt.Errorf("暂不支持将 %s 转换为 CNY", currency)
+	}
+}
+
+func sendFeishuText(webhook, content string) error {
+	return sendFeishuTextWithClient(&http.Client{Timeout: 15 * time.Second}, webhook, content)
+}
+
+func sendFeishuTextWithClient(client *http.Client, webhook, content string) error {
+	payload := map[string]any{
+		"msg_type": "text",
+		"content":  map[string]string{"text": content},
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequest(http.MethodPost, webhook, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json; charset=utf-8")
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 1024*1024))
+	if err != nil {
+		return err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("飞书 webhook HTTP 状态异常: %d", resp.StatusCode)
+	}
+	var result struct {
+		Code       *int   `json:"code"`
+		StatusCode *int   `json:"StatusCode"`
+		Msg        string `json:"msg"`
+	}
+	if err := json.Unmarshal(respBody, &result); err == nil {
+		if result.Code != nil && *result.Code != 0 {
+			return fmt.Errorf("飞书 webhook 返回失败: code=%d msg=%s", *result.Code, result.Msg)
+		}
+		if result.StatusCode != nil && *result.StatusCode != 0 {
+			return fmt.Errorf("飞书 webhook 返回失败: StatusCode=%d", *result.StatusCode)
+		}
+	}
+	return nil
 }
 
 func extractDateYMD(raw string) string {

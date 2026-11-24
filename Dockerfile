@@ -19,7 +19,7 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 
 COPY . .
 
-ARG DEFAULT_FLARESOLVERR_URL=http://172.25.0.102:8191/v1
+ARG DEFAULT_FLARESOLVERR_URL=http://172.25.8.16:8191/v1
 
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
     -ldflags "-s -w -X main.defaultFlareSolverrURL=${DEFAULT_FLARESOLVERR_URL}" \

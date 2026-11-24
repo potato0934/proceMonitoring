@@ -80,6 +80,7 @@ go run ./cmd/price-monitor schedule
 - `COLLECT_TIMES`：逗号分隔的时间点，格式 `HH:MM`，默认 `09:00,11:00,15:00`
 - `PUSH_TIMES`：逗号分隔的推送时间点，格式 `HH:MM`，默认 `12:00`（企业微信机器人价格推送）
 - `SCHEDULE_TZ`：时区，默认 `Asia/Shanghai`
+- `FEISHU_BOT_WEBHOOK`：飞书群自定义机器人 Webhook；价格相对上一条历史记录发生变化时推送
 
 示例：
 
@@ -107,8 +108,17 @@ go run ./cmd/price-monitor notify
 
 告警通知（已内置）：
 
-- 当 FlareSolverr 目标为 `172.25.0.102` 且连接不可达时，会自动发送企业微信告警（含错误原因）。
+- 当 FlareSolverr 目标为 `172.25.8.16` 且连接不可达时，会自动发送企业微信告警（含错误原因）。
 - 当本轮采集出现失败项（`failed > 0`）时，会自动发送企业微信告警（含失败摘要）。
+
+### 飞书价格变动推送
+
+飞书推送使用 `FEISHU_BOT_WEBHOOK` 环境变量配置。Webhook 地址属于密钥，请勿提交到代码仓库；Docker Compose 会从启动环境读取此变量。采集到的价格与该商品上一条历史价格不同时，程序会推送本次发生变动的商品；通知以 `↑ 上涨` 或 `↓ 下降` 标识价格变动方向，以 `CNY` 标识换算后的人民币价格，并同时注明商户原始币种和价格。HKD 使用配置的 HKD/CNY 汇率换算；首次建立价格记录不推送，价格未变化也不推送。
+
+```bash
+export FEISHU_BOT_WEBHOOK="https://open.feishu.cn/open-apis/bot/v2/hook/你的机器人密钥"
+docker compose up -d --force-recreate
+```
 
 ## 5. 定时每日采集（macOS/Linux cron，可选）
 
@@ -134,6 +144,7 @@ go run ./cmd/price-monitor notify
 - `LOG_RETENTION_DAYS`：日志保留天数（默认 `7`，程序每天自动清理更早日志）
 - `BASE_PATH`：Web 路径前缀（默认空；例如设为 `/price` 后，页面地址为 `http://host:port/price/`）
 - `WECHAT_BOT_WEBHOOK`：企业微信机器人 Webhook 地址（用于 `PUSH_TIMES` 推送）
+- `FEISHU_BOT_WEBHOOK`：飞书群自定义机器人 Webhook（价格变动时推送）
 
 ## 命令说明
 
@@ -208,15 +219,15 @@ docker run -d --name flaresolverr -p 8191:8191 ghcr.io/flaresolverr/flaresolverr
 2. 采集时启用：
 
 ```bash
-FLARESOLVERR_URL='http://172.25.0.102:8191/v1' go run ./cmd/price-monitor collect
+FLARESOLVERR_URL='http://172.25.8.16:8191/v1' go run ./cmd/price-monitor collect
 ```
 
-说明：如果未设置 `FLARESOLVERR_URL`，程序会使用构建时默认值（当前默认 `http://172.25.0.102:8191/v1`）。
+说明：如果未设置 `FLARESOLVERR_URL`，程序会使用构建时默认值（当前默认 `http://172.25.8.16:8191/v1`）。
 程序会自动创建并复用会话 `pricemonitor`（可通过 `FLARESOLVERR_SESSION` 覆盖），并在挑战页时自动重建会话重试。
 
 推荐在容器中固定以下参数（已写入仓库 `docker-compose.yml`）：
 
-- `FLARESOLVERR_URL=http://172.25.0.102:8191/v1`
+- `FLARESOLVERR_URL=http://172.25.8.16:8191/v1`
 - `FLARESOLVERR_MAX_TIMEOUT_MS=180000`
 - `FLARESOLVERR_HTTP_TIMEOUT_SECONDS=240`
 - `FLARESOLVERR_MAX_RETRIES=3`
@@ -237,7 +248,7 @@ FLARESOLVERR_URL='http://172.25.0.102:8191/v1' go run ./cmd/price-monitor collec
 
 ```bash
 docker build -t price-monitor:latest \
-  --build-arg DEFAULT_FLARESOLVERR_URL=http://172.25.0.102:8191/v1 \
+  --build-arg DEFAULT_FLARESOLVERR_URL=http://172.25.8.16:8191/v1 \
   --build-arg DEFAULT_BASE_PATH=/price \
   .
 ```
@@ -300,4 +311,4 @@ RUN_COLLECT_AFTER_DEPLOY=true \
 ./scripts/deploy_remote.sh
 ```
 
-说明：默认部署到 `172.25.1.239`，默认镜像标签 `price-monitor:0.2`，默认 FlareSolverr 地址 `http://172.25.0.102:8191/v1`。
+说明：默认部署到 `172.25.1.239`，默认镜像标签 `price-monitor:0.2`，默认 FlareSolverr 地址 `http://172.25.8.16:8191/v1`。

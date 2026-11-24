@@ -76,7 +76,7 @@
               <th>商品</th>
               <th>店铺</th>
               <th>最新价格</th>
-              <th>手续费(1%)</th>
+              <th>含手续费</th>
               <th>采集状态</th>
               <th>操作</th>
             </tr>
@@ -288,6 +288,14 @@
       const tbody = document.getElementById('rows');
       const today = todayYMDCN();
       tbody.innerHTML = data.map((p, idx) => {
+        const baseCurrency = String(p.currency || 'CNY').toUpperCase();
+        const latestCNY = baseCurrency === 'HKD'
+          ? (fxRate ? p.latest_price * fxRate : null)
+          : (baseCurrency === 'CNY' ? p.latest_price : null);
+        const feeBasePrice = p.latest_price / 0.99;
+        const feeCNY = baseCurrency === 'HKD'
+          ? (fxRate ? feeBasePrice * fxRate : null)
+          : (baseCurrency === 'CNY' ? feeBasePrice : null);
         const latestPriceDate = formatYMD(p.latest_updated_at || p.latest_date);
         const merchantUpdateDate = extractYMD(p.merchant_update || '');
         const staleByCollect = p.latest_price != null && latestPriceDate && latestPriceDate !== today;
@@ -323,7 +331,7 @@
               : `
                 <div class="price-stack">
                   <div class="price-cny">
-                    <span class="price-value ${staleCls}">${(fxRate ? (p.latest_price * fxRate).toFixed(2) : '-')} CNY</span>
+                    <span class="price-value ${staleCls}">${(latestCNY != null ? latestCNY.toFixed(2) : '-')} CNY</span>
                     ${(() => {
                       const t = trendMeta(p.latest_price, p.prev_price);
                       return `<span class="trend-icon ${t.cls}" title="${t.title}">${t.icon}</span>`;
@@ -335,13 +343,13 @@
                 </div>
               `
           }</td>
-          <td data-label="手续费(1%)">${
+          <td data-label="含手续费">${
             p.latest_price == null
               ? '-'
               : `
                 <div class="price-stack">
-                  <div class="price-cny"><span class="price-value ${staleCls}">${(fxRate ? (p.latest_price * 0.01 * fxRate).toFixed(2) : '-')} CNY</span></div>
-                  <div class="price-hkd"><span class="price-value ${staleCls}">${(p.latest_price * 0.01).toFixed(2)} ${p.currency}</span></div>
+                  <div class="price-cny"><span class="price-value ${staleCls}">${(feeCNY != null ? feeCNY.toFixed(2) : '-')} CNY</span></div>
+                  <div class="price-hkd"><span class="price-value ${staleCls}">${feeBasePrice.toFixed(2)} ${p.currency}</span></div>
                 </div>
               `
           }</td>
